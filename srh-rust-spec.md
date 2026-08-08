@@ -36,7 +36,7 @@ base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 jsonwebtoken = "9"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+url = "2"
 dashmap = "6"
 thiserror = "2"
 anyhow = "1"
@@ -48,12 +48,28 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 
 [dev-dependencies]
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 testcontainers = "0.23"
 wiremock = "0.6"
 ```
 
 Note: `subtle` is no longer needed — all token comparison is digest-vs-digest (see Phase 1).
+
+**No `reqwest`, here or in any later phase.** HTTP client work uses `hyper` directly, which
+is already a direct dependency for the inbound listener. Phase 6 is the only phase that
+needs an outbound client; it adds `hyper/client`, `hyper-util` (`client`, `client-legacy`
+for pooling), `hyper-rustls`, and `http-body-util` AT THAT POINT, not before — an unused
+dependency carried across phases is how an unnoticed transitive feature conflict gets in
+(see the `metrics-exporter-prometheus` / rustls-provider incident). Dropping reqwest costs
+about two crates net, so the reason is stack consistency and request-path performance,
+not tree size.
+
+**Pair `hyper-rustls` with `rustls-native-certs`, never `webpki-roots`.** fred already
+trusts the OS store; a client trusting bundled Mozilla roots instead would fail against a
+Keycloak behind an internal or corporate CA — with an unknown-issuer TLS error that adding
+the CA to the system store does not fix. Both TLS paths must share one trust story.
+
+`url` is used only for config validation (`auth.jwt.issuer`); do not pull an HTTP client
+to parse a URL.
 
 Module layout (hexagonal — see §0.5; phase labels show where each file is built):
 
@@ -73,7 +89,7 @@ src/
   ports/
     mod.rs               # ALL trait definitions live here (Phase 1, extended later)
   adapters/
-    fred_executor.rs     # Phase 2: CommandExecutor over fred (+ Value→RespValue map)
+    fred_executor.rs     # Phase 2: CommandExecutor over fred (+ frame→RespValue map)
     pool_manager.rs      # Phase 4: ExecutorProvider (lazy pools, semaphore, eviction)
     breaker_executor.rs  # Phase 4: decorator, CommandExecutor wrapping CommandExecutor
     static_auth.rs       # Phase 1: Authenticator
@@ -101,7 +117,7 @@ src/
 
 ### The dependency rule
 
-`domain/` imports only std, `serde_json`, `bytes`, `sha2`, and `ports/` types. It NEVER
+`domain/` imports only std, `serde_json`, `bytes`, `base64`, `sha2`, and `ports/` types. It NEVER
 imports fred, axum, tower, hyper, reqwest, or tokio's I/O — tokio sync primitives
 (Semaphore, atomics) are allowed. `ports/` imports only domain types. `adapters/` and
 `http/` may import anything. `main.rs` is the ONLY place a concrete adapter type is
@@ -529,7 +545,7 @@ must never be retried as a static token). Chain exhausted → 401. Phase 1 wires
 - `domain/resp.rs`: define
   `RespValue { Simple(String), Bulk(bytes::Bytes), Int(i64), Nil, Array(Vec<RespValue>) }`.
   The domain NEVER sees fred types; `adapters/fred_executor.rs` maps
-  `fred::types::Value → RespValue` (exhaustive match — RESP2 is forced, so RESP3-only
+  raw `fred::types::Resp3Frame → RespValue` (exhaustive match — RESP2 is forced, so RESP3-only
   variants map to `ExecError::Transport` with a "protocol violation" message, never a
   silent lossy conversion).
 - `redis_value_to_json(v: RespValue, encoding: Encoding, budget: &mut usize) -> Result<serde_json::Value, AppError>`
@@ -907,7 +923,7 @@ at Redis with a NOPERM error.
 ## Phase 6 — JWT auth via Keycloak (adapters/jwt_auth.rs, adapters/http_jwks.rs)
 
 `JwtAuth` implements `Authenticator` and depends on `Arc<dyn JwksSource>` (and
-`Arc<dyn Introspector>` when enabled) — NOT on reqwest. All Phase 6 unit tests run
+`Arc<dyn Introspector>` when enabled) — NOT on the HTTP client. All Phase 6 unit tests run
 against `FakeJwks`; wiremock is used only in the integration tests that exercise
 `HttpJwks` itself.
 
@@ -923,7 +939,12 @@ against `FakeJwks`; wiremock is used only in the integration tests that exercise
   the same kty; ingesting one produces baffling verification failures on kid
   collision.
 - Refresh when kid unknown (≤1 forced refresh per 30s) or age > `jwks_refresh_secs`.
-- reqwest: 5s timeout, rustls.
+- Transport: `hyper` + `hyper-util`'s pooling client over `hyper-rustls`
+  (`rustls-native-certs` roots, ring provider — matching fred). 5s timeout via
+  `tokio::time::timeout`. Bound the response body with `http_body_util::Limited` before
+  parsing: a JWKS reply has a known small size, and "everything bounded" applies to
+  outbound responses too. Redirects are NOT followed — a discovery document or JWKS URI
+  that redirects is a misconfiguration worth surfacing, not silently chasing.
 
 ### adapters/jwt_auth.rs — validation
 - Parse header for `kid` ONLY. Resolve the cached key.

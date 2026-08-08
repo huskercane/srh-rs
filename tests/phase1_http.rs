@@ -9,17 +9,43 @@ use srh_rs::AppState;
 use srh_rs::adapters::auth_chain::AuthChain;
 use srh_rs::adapters::static_auth::StaticAuth;
 use srh_rs::config::Config;
-use srh_rs::domain::resp::{AcquireError, PoolReadiness};
+use srh_rs::domain::resp::{AcquireError, ExecError, PoolReadiness, RespValue};
 use srh_rs::http;
-use srh_rs::ports::{Authenticator, Clock, ExecutorHandle, ExecutorProvider};
+use srh_rs::ports::{
+    Authenticator, Clock, CommandExecutor, ExecutorHandle, ExecutorProvider, RedisCommand,
+};
 use tower::ServiceExt;
 
-struct UnusedProvider;
+struct FixedExecutor {
+    result: Result<RespValue, ExecError>,
+}
 
 #[async_trait]
-impl ExecutorProvider for UnusedProvider {
+impl CommandExecutor for FixedExecutor {
+    async fn execute(&self, _command: RedisCommand) -> Result<RespValue, ExecError> {
+        self.result.clone()
+    }
+
+    async fn pipeline(&self, _commands: Vec<RedisCommand>) -> Vec<Result<RespValue, ExecError>> {
+        unreachable!("pipeline remains a Phase 3 route")
+    }
+
+    async fn transaction(&self, _commands: Vec<RedisCommand>) -> Result<Vec<RespValue>, ExecError> {
+        unreachable!("transactions remain a Phase 3 route")
+    }
+}
+
+struct FixedProvider {
+    executor: Arc<dyn CommandExecutor>,
+}
+
+#[async_trait]
+impl ExecutorProvider for FixedProvider {
     async fn acquire(&self, _pool: &str) -> Result<ExecutorHandle, AcquireError> {
-        unreachable!("Phase 1 handlers do not acquire Redis pools")
+        Ok(ExecutorHandle::new(
+            Arc::clone(&self.executor),
+            Box::new(()),
+        ))
     }
 
     async fn readiness(&self) -> Vec<PoolReadiness> {
@@ -48,12 +74,22 @@ fn app() -> axum::Router {
     );
     let static_auth: Arc<dyn Authenticator> =
         Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
-    app_with_auth(Arc::new(AuthChain::new(vec![static_auth])), config)
+    app_with_auth(
+        Arc::new(AuthChain::new(vec![static_auth])),
+        config,
+        Ok(RespValue::Simple("PONG".to_owned())),
+    )
 }
 
-fn app_with_auth(authenticator: Arc<dyn Authenticator>, config: Arc<Config>) -> axum::Router {
+fn app_with_auth(
+    authenticator: Arc<dyn Authenticator>,
+    config: Arc<Config>,
+    result: Result<RespValue, ExecError>,
+) -> axum::Router {
     http::router(AppState {
-        provider: Arc::new(UnusedProvider),
+        provider: Arc::new(FixedProvider {
+            executor: Arc::new(FixedExecutor { result }),
+        }),
         authenticator,
         clock: Arc::new(TestClock),
         cfg: config,
@@ -87,7 +123,7 @@ async fn wrong_token_returns_unauthorized_json() {
 }
 
 #[tokio::test]
-async fn right_token_reaches_the_phase_one_stub() {
+async fn right_token_executes_command_and_tolerates_sync_header() {
     let response = app()
         .oneshot(
             Request::post("/")
@@ -99,10 +135,108 @@ async fn right_token_reaches_the_phase_one_stub() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await, json!({ "result": "PONG" }));
+}
+
+#[tokio::test]
+async fn base64_encoding_preserves_binary_bulk_values() {
+    let config = Arc::new(
+        Config::from_json(
+            r#"{"auth":{"static_tokens":{"right-token":{"pool":"cache"}}},"pools":{"cache":{"connection_string":"redis://localhost:6379"}}}"#,
+        )
+        .expect("test configuration should parse"),
+    );
+    let static_auth: Arc<dyn Authenticator> =
+        Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
+    let response = app_with_auth(
+        Arc::new(AuthChain::new(vec![static_auth])),
+        config,
+        Ok(RespValue::Bulk(bytes::Bytes::from_static(&[
+            0xff, 0xfe, 0x00, 0x01,
+        ]))),
+    )
+    .oneshot(
+        Request::post("/")
+            .header(header::AUTHORIZATION, "Bearer right-token")
+            .header("upstash-encoding", "BASE64")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"["GET","binary"]"#))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response_json(response).await,
-        json!({ "error": "Not implemented" })
+        json!({ "result": "//4AAQ==" })
+    );
+}
+
+#[tokio::test]
+async fn redis_errors_are_returned_verbatim() {
+    let config = Arc::new(
+        Config::from_json(
+            r#"{"auth":{"static_tokens":{"right-token":{"pool":"cache"}}},"pools":{"cache":{"connection_string":"redis://localhost:6379"}}}"#,
+        )
+        .expect("test configuration should parse"),
+    );
+    let static_auth: Arc<dyn Authenticator> =
+        Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
+    let message = "WRONGTYPE Operation against a key holding the wrong kind of value";
+    let response = app_with_auth(
+        Arc::new(AuthChain::new(vec![static_auth])),
+        config,
+        Err(ExecError::Redis(message.to_owned())),
+    )
+    .oneshot(
+        Request::post("/")
+            .header(header::AUTHORIZATION, "Bearer right-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"["GET","key"]"#))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response_json(response).await, json!({ "error": message }));
+}
+
+#[tokio::test]
+async fn oversized_response_fails_the_whole_request_with_bad_gateway() {
+    // The commands DID execute; 502 means the reply could not be rendered
+    // inside `load.max_response_bytes`. Clients must treat it as indeterminate.
+    let config = Arc::new(
+        Config::from_json(
+            r#"{"server":{"load":{"max_response_bytes":16}},"auth":{"static_tokens":{"right-token":{"pool":"cache"}}},"pools":{"cache":{"connection_string":"redis://localhost:6379"}}}"#,
+        )
+        .expect("test configuration should parse"),
+    );
+    let static_auth: Arc<dyn Authenticator> =
+        Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
+    let response = app_with_auth(
+        Arc::new(AuthChain::new(vec![static_auth])),
+        config,
+        Ok(RespValue::Bulk(bytes::Bytes::from_static(
+            b"a reply far larger than the configured response budget",
+        ))),
+    )
+    .oneshot(
+        Request::post("/")
+            .header(header::AUTHORIZATION, "Bearer right-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"["GET","key"]"#))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response_json(response).await,
+        json!({ "error": "Response too large" })
     );
 }
 
@@ -124,16 +258,20 @@ impl Authenticator for UnavailableAuth {
 #[tokio::test]
 async fn authentication_dependency_failure_returns_service_unavailable() {
     let config = Arc::new(Config::from_json("{}").expect("default config should parse"));
-    let response = app_with_auth(Arc::new(UnavailableAuth), config)
-        .oneshot(
-            Request::post("/")
-                .header(header::AUTHORIZATION, "Bearer opaque-token")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"["PING"]"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = app_with_auth(
+        Arc::new(UnavailableAuth),
+        config,
+        Ok(RespValue::Simple("unused".to_owned())),
+    )
+    .oneshot(
+        Request::post("/")
+            .header(header::AUTHORIZATION, "Bearer opaque-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"["PING"]"#))
+            .unwrap(),
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         response_json(response).await,

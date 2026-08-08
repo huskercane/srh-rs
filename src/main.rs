@@ -10,23 +10,38 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use srh_rs::adapters::auth_chain::AuthChain;
+use srh_rs::adapters::fred_executor::FredExecutor;
 use srh_rs::adapters::static_auth::StaticAuth;
 use srh_rs::adapters::system_clock::SystemClock;
 use srh_rs::config::Config;
 use srh_rs::domain::resp::{AcquireError, PoolReadiness};
-use srh_rs::ports::{Authenticator, ExecutorHandle, ExecutorProvider};
+use srh_rs::ports::{Authenticator, CommandExecutor, ExecutorHandle, ExecutorProvider};
 use srh_rs::{AppState, http};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
-struct PhaseOneProvider;
+struct PhaseTwoProvider {
+    config: Arc<Config>,
+}
 
 #[async_trait]
-impl ExecutorProvider for PhaseOneProvider {
-    async fn acquire(&self, _pool: &str) -> Result<ExecutorHandle, AcquireError> {
-        Err(AcquireError::Internal(
-            "Redis execution is not implemented".to_owned(),
-        ))
+impl ExecutorProvider for PhaseTwoProvider {
+    async fn acquire(&self, pool: &str) -> Result<ExecutorHandle, AcquireError> {
+        let pool_config = self
+            .config
+            .pools
+            .get(pool)
+            .ok_or_else(|| AcquireError::UnknownPool(pool.to_owned()))?;
+        let executor = FredExecutor::connect(
+            pool_config.connection_string.expose(),
+            Duration::from_millis(pool_config.acquire_timeout_ms),
+            Duration::from_millis(pool_config.command_timeout_ms),
+            self.config.server.max_pipeline_commands,
+        )
+        .await
+        .map_err(|error| AcquireError::Internal(error.to_string()))?;
+        let executor: Arc<dyn CommandExecutor> = Arc::new(executor);
+        Ok(ExecutorHandle::new(executor, Box::new(())))
     }
 
     async fn readiness(&self) -> Vec<PoolReadiness> {
@@ -47,7 +62,9 @@ async fn main() -> Result<()> {
         Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
     let authenticator: Arc<dyn Authenticator> = Arc::new(AuthChain::new(vec![static_auth]));
     let state = AppState {
-        provider: Arc::new(PhaseOneProvider),
+        provider: Arc::new(PhaseTwoProvider {
+            config: Arc::clone(&config),
+        }),
         authenticator,
         clock: Arc::new(SystemClock),
         cfg: Arc::clone(&config),

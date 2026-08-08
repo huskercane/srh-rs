@@ -3,6 +3,8 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
+use crate::domain::convert::ConversionError;
+
 #[derive(Debug)]
 pub enum AppError {
     Unauthorized,
@@ -23,6 +25,15 @@ pub enum AppError {
     ResponseTooLarge,
     RequestBodyTimeout,
     Internal(String),
+}
+
+impl From<ConversionError> for AppError {
+    fn from(error: ConversionError) -> Self {
+        match error {
+            ConversionError::InvalidCommand => Self::BadRequest("Invalid command".to_owned()),
+            ConversionError::ResponseTooLarge => Self::ResponseTooLarge,
+        }
+    }
 }
 
 impl IntoResponse for AppError {

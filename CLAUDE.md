@@ -208,6 +208,7 @@ body must never hold a Redis permit.
 
 ## Current implementation status
 
-Phases 0 and 1 are complete. API routes authenticate and enforce the global admission stack,
-but intentionally return 501 until Phase 2 adds Redis execution. Deferred work is marked with
-`TODO(phaseN)` comments where later phases attach to the current skeleton.
+Phases 0–2 are complete. `POST /` authenticates, enforces the global admission stack, executes
+one Redis command, and converts the RESP2 result. Pipeline and transaction routes intentionally
+return 501 until Phase 3. Deferred work is marked with `TODO(phaseN)` comments where later phases
+attach to the current implementation.

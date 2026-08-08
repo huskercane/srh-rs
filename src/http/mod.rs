@@ -23,7 +23,7 @@ pub fn router(state: AppState) -> Router {
     let limits = &state.cfg.server;
     let api = apply_admission_controls(
         Router::new()
-            .route("/", post(command::not_implemented))
+            .route("/", post(command::execute))
             .route("/pipeline", post(command::not_implemented))
             .route("/multi-exec", post(command::not_implemented))
             .method_not_allowed_fallback(method_not_allowed),

@@ -13,9 +13,9 @@ Wire compatibility with the `@upstash/redis` SDK is the top-level design require
 
 > ### Status: specification-complete, implementation in progress
 >
-> Phases 0 and 1 are implemented: the architecture scaffold, configuration, static-token
-> authentication, admission controls, and HTTP skeleton are working. Redis command execution
-> still returns 501 until Phase 2. The normative
+> Phases 0–2 are implemented: the architecture scaffold, configuration, static-token
+> authentication, admission controls, RESP conversion, and single-command Redis execution are
+> working. Pipeline and transaction routes remain deferred to Phase 3. The normative
 > specification is [`srh-rust-spec.md`](./srh-rust-spec.md), which defines ten phases; this
 > README documents the system that spec describes.
 >
@@ -23,7 +23,7 @@ Wire compatibility with the `@upstash/redis` SDK is the top-level design require
 > |---|---|---|
 > | 0 | Project setup, hexagonal skeleton, ports | Done |
 > | 1 | Config, errors, static auth, HTTP skeleton | Done |
-> | 2 | RESP↔JSON conversion, `POST /` | Not started |
+> | 2 | RESP↔JSON conversion, `POST /` | Done |
 > | 3 | `POST /pipeline`, `POST /multi-exec` | Not started |
 > | 4 | Lazy pools, timeouts, circuit breaker, eviction | Not started |
 > | 5 | Command ACLs, rate limiting | Not started |
