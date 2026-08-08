@@ -1,2 +1,5 @@
 /target/
-
+/srh-config/*
+!/srh-config/tokens.example.json
+.env*
+!.env.example
