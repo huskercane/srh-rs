@@ -13,9 +13,10 @@ Wire compatibility with the `@upstash/redis` SDK is the top-level design require
 
 > ### Status: specification-complete, implementation in progress
 >
-> Phases 0–3 are implemented: the architecture scaffold, configuration, static-token
+> Phases 0–4 are implemented: the architecture scaffold, configuration, static-token
 > authentication, admission controls, RESP conversion, and all three Redis execution routes are
-> working. Command ACLs remain permissive until Phase 5. The normative
+> working with lazy bounded pools, Fred-level timeouts, circuit breaking, and idle eviction.
+> Command ACLs remain permissive until Phase 5. The normative
 > specification is [`srh-rust-spec.md`](./srh-rust-spec.md), which defines ten phases; this
 > README documents the system that spec describes.
 >
@@ -25,7 +26,7 @@ Wire compatibility with the `@upstash/redis` SDK is the top-level design require
 > | 1 | Config, errors, static auth, HTTP skeleton | Done |
 > | 2 | RESP↔JSON conversion, `POST /` | Done |
 > | 3 | `POST /pipeline`, `POST /multi-exec` | Done |
-> | 4 | Lazy pools, timeouts, circuit breaker, eviction | Not started |
+> | 4 | Lazy pools, timeouts, circuit breaker, eviction | Done |
 > | 5 | Command ACLs, rate limiting | Not started |
 > | 6 | Keycloak JWT auth, JWKS, introspection | Not started |
 > | 7 | Hardening, observability, packaging | Not started |
@@ -328,10 +329,9 @@ is low priority — the intended deployment terminates TLS at a reverse proxy.
 
 **Startup validation** rejects the config and exits with a clear message if any token
 references a missing pool, the issuer is not a valid URL, a bound is zero, or — for any pool
-— `acquire_timeout_ms + command_timeout_ms >= http_timeout_ms`. That last check is a sum, not
-a pair of independent comparisons: both can individually fit inside the HTTP timeout while
-their sum does not, in which case the HTTP timeout fires mid-command and the proxy's own
-saturation metrics start under-counting real work.
+— `acquire_timeout_ms + 2 * command_timeout_ms >= http_timeout_ms`. The second command-timeout
+budget covers the bounded forced connection reset after Fred reports a timeout. Without it,
+the HTTP backstop could drop a handler while its connection was still being reset.
 
 Secrets (`connection_string`, `client_secret`) are held in a wrapper whose `Debug` output is
 `<redacted>` and which zeroizes on drop.
@@ -341,12 +341,13 @@ Secrets (`connection_string`, `client_secret`) are held in a wrapper whose `Debu
 A client's worst case for one logical operation is:
 
 ```
-retries × (acquire_timeout_ms + command_timeout_ms)
+retries × (acquire_timeout_ms + 2 × command_timeout_ms)
 ```
 
 Size pool timeouts so that product fits inside the *caller's* deadline. An auth-refresh path
-with an 8-second budget, using an SDK that makes 3 attempts, needs roughly 1.25 s per attempt
-— which is why the `authkv` example uses `250 + 1000` rather than the defaults' 2500.
+with an 8-second budget, using an SDK that makes 3 attempts, needs less than 2.67 s per attempt
+— which is why the `authkv` example totals `250 + 2 × 1000 = 2250` ms rather than the
+defaults' 4500 ms.
 
 ### Rate limit sizing
 
@@ -514,7 +515,9 @@ authentication.
 
 Health and readiness sit outside the admission-control stack on purpose. An overloaded proxy
 that cannot answer its health check gets restarted by the orchestrator mid-recovery, which is
-worse than the overload.
+worse than the overload. Readiness PINGs bypass pool request permits and breaker admission:
+a saturated but reachable Redis remains ready, and health checks cannot consume a half-open
+traffic probe.
 
 Metrics cover request counts and latency by endpoint and status, per-pool connection gauges,
 pool builds and evictions, auth failures by kind, rate-limit rejections, and saturation

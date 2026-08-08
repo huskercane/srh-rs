@@ -74,6 +74,7 @@ async fn method_not_allowed() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
@@ -114,6 +115,45 @@ mod tests {
         }
     }
 
+    struct AllowAuthenticator;
+
+    #[async_trait]
+    impl Authenticator for AllowAuthenticator {
+        async fn authenticate(&self, _bearer: &str) -> Result<Option<Identity>, AuthError> {
+            Ok(Some(Identity {
+                subject: "test".to_owned(),
+                bucket_key: "test".to_owned(),
+                pool: "test".to_owned(),
+                read_only: false,
+                is_admin: false,
+                legacy: false,
+                allowed_commands: None,
+                blocked_commands: HashSet::new(),
+                allowed_script_sha256: HashSet::new(),
+                key_prefix: None,
+            }))
+        }
+    }
+
+    struct BlockingProvider {
+        entered: Notify,
+        release: Semaphore,
+    }
+
+    #[async_trait]
+    impl ExecutorProvider for BlockingProvider {
+        async fn acquire(&self, _pool: &str) -> Result<ExecutorHandle, AcquireError> {
+            self.entered.notify_one();
+            let permit = self.release.acquire().await.unwrap();
+            permit.forget();
+            Err(AcquireError::Overloaded)
+        }
+
+        async fn readiness(&self) -> Vec<PoolReadiness> {
+            Vec::new()
+        }
+    }
+
     struct TestClock;
 
     impl Clock for TestClock {
@@ -149,6 +189,14 @@ mod tests {
 
     fn request(path: &str) -> Request<Body> {
         Request::get(path).body(Body::empty()).unwrap()
+    }
+
+    fn api_request(path: &str, body: &'static str) -> Request<Body> {
+        Request::post(path)
+            .header(header::AUTHORIZATION, "Bearer test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap()
     }
 
     #[tokio::test]
@@ -203,5 +251,48 @@ mod tests {
         probe.release.add_permits(1);
         assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
         assert_eq!(probe.peak.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn all_real_api_endpoints_are_inside_the_shared_global_limit() {
+        let config = Arc::new(
+            Config::from_json(
+                r#"{"server":{"load":{"max_in_flight":1,"shed_retry_after_secs":9}}}"#,
+            )
+            .unwrap(),
+        );
+        let provider = Arc::new(BlockingProvider {
+            entered: Notify::new(),
+            release: Semaphore::new(0),
+        });
+        let state = AppState {
+            provider: provider.clone(),
+            authenticator: Arc::new(AllowAuthenticator),
+            clock: Arc::new(TestClock),
+            cfg: config,
+        };
+        let app = router(state);
+
+        let first = tokio::spawn(app.clone().oneshot(api_request("/", r#"["PING"]"#)));
+        provider.entered.notified().await;
+
+        for (path, body) in [
+            ("/pipeline", r#"[["PING"]]"#),
+            ("/multi-exec", r#"[["PING"]]"#),
+        ] {
+            let response = app.clone().oneshot(api_request(path, body)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[header::RETRY_AFTER], "9");
+        }
+        assert_eq!(
+            app.oneshot(request("/health")).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        provider.release.add_permits(1);
+        assert_eq!(
+            first.await.unwrap().unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }

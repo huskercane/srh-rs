@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -14,7 +15,9 @@ use crate::ports::{CommandExecutor, RedisCommand};
 
 pub struct FredExecutor {
     client: Client,
-    connection_task: ConnectHandle,
+    connection_task: Option<ConnectHandle>,
+    reset_timeout: Duration,
+    reset_started: AtomicBool,
 }
 
 impl FredExecutor {
@@ -47,8 +50,20 @@ impl FredExecutor {
         let connection_task = client.init().await.map_err(map_fred_error)?;
         Ok(Self {
             client,
-            connection_task,
+            connection_task: Some(connection_task),
+            reset_timeout: command_timeout,
+            reset_started: AtomicBool::new(false),
         })
+    }
+
+    /// Wraps a client whose connection task is owned by a long-lived pool.
+    pub fn from_pooled_client(client: Client, reset_timeout: Duration) -> Self {
+        Self {
+            client,
+            connection_task: None,
+            reset_timeout,
+            reset_started: AtomicBool::new(false),
+        }
     }
 
     fn command(command: RedisCommand) -> (CustomCommand, Vec<bytes::Bytes>) {
@@ -57,13 +72,39 @@ impl FredExecutor {
             command.args,
         )
     }
+
+    async fn map_error(&self, error: Error, response_stage: bool) -> ExecError {
+        let mapped = if response_stage {
+            map_fred_response_error(error)
+        } else {
+            map_fred_error(error)
+        };
+        // A timeout on a connected client can leave an unread response. A
+        // disconnected client is already in Fred's reconnect loop; sending a
+        // second reconnect command there can delay recovery.
+        if mapped == ExecError::Timeout
+            && self.client.is_connected()
+            && !self.reset_started.swap(true, Ordering::AcqRel)
+        {
+            match tokio::time::timeout(self.reset_timeout, self.client.force_reconnection()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(reconnect_error)) => {
+                    tracing::warn!(%reconnect_error, "failed to reset Redis connection after timeout");
+                }
+                Err(_) => {
+                    tracing::warn!("timed out resetting Redis connection after command timeout");
+                }
+            }
+        }
+        mapped
+    }
 }
 
 impl Drop for FredExecutor {
     fn drop(&mut self) {
-        // Phases 2–3 create one client per request. Aborting prevents detached
-        // reconnect tasks; Phase 4 replaces this with long-lived pools + quit().
-        self.connection_task.abort();
+        if let Some(connection_task) = &self.connection_task {
+            connection_task.abort();
+        }
     }
 }
 
@@ -71,11 +112,10 @@ impl Drop for FredExecutor {
 impl CommandExecutor for FredExecutor {
     async fn execute(&self, command: RedisCommand) -> Result<RespValue, ExecError> {
         let (command, args) = Self::command(command);
-        let frame = self
-            .client
-            .custom_raw(command, args)
-            .await
-            .map_err(map_fred_error)?;
+        let frame = match self.client.custom_raw(command, args).await {
+            Ok(frame) => frame,
+            Err(error) => return Err(self.map_error(error, false).await),
+        };
         fred_frame_to_resp(frame)
     }
 
@@ -92,15 +132,14 @@ impl CommandExecutor for FredExecutor {
         let transaction = self.client.multi();
         for command in commands {
             let (command, args) = Self::command(command);
-            transaction
-                .custom::<Value, _>(command, args)
-                .await
-                .map_err(map_fred_error)?;
+            if let Err(error) = transaction.custom::<Value, _>(command, args).await {
+                return Err(self.map_error(error, false).await);
+            }
         }
-        let value: Value = transaction
-            .exec(true)
-            .await
-            .map_err(map_fred_response_error)?;
+        let value: Value = match transaction.exec(true).await {
+            Ok(value) => value,
+            Err(error) => return Err(self.map_error(error, true).await),
+        };
         match fred_value_to_resp(value)? {
             RespValue::Array(values) => Ok(values),
             RespValue::Nil => Err(ExecError::Redis(

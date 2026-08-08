@@ -417,15 +417,18 @@ impl Config {
                 &format!("pools.{name}.breaker.cooldown_ms"),
                 pool.breaker.cooldown_ms,
             )?;
+            let command_and_reset = pool.command_timeout_ms.checked_mul(2).ok_or_else(|| {
+                ConfigError::Validation(format!("timeouts overflow for pool '{name}'"))
+            })?;
             let total = pool
                 .acquire_timeout_ms
-                .checked_add(pool.command_timeout_ms)
+                .checked_add(command_and_reset)
                 .ok_or_else(|| {
                     ConfigError::Validation(format!("timeouts overflow for pool '{name}'"))
                 })?;
             if total >= self.server.http_timeout_ms {
                 return Err(ConfigError::Validation(format!(
-                    "pool '{name}' requires acquire_timeout_ms + command_timeout_ms < http_timeout_ms"
+                    "pool '{name}' requires acquire_timeout_ms + 2 * command_timeout_ms < http_timeout_ms"
                 )));
             }
         }
@@ -996,15 +999,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_timeout_sum_that_reaches_http_timeout() {
+    fn rejects_acquire_command_and_reset_sum_that_reaches_http_timeout() {
         let error = Config::from_json(
-            r#"{"server":{"http_timeout_ms":2500},"pools":{"cache":{"connection_string":"redis://localhost:6379","acquire_timeout_ms":500,"command_timeout_ms":2000}}}"#,
+            r#"{"server":{"http_timeout_ms":4500},"pools":{"cache":{"connection_string":"redis://localhost:6379","acquire_timeout_ms":500,"command_timeout_ms":2000}}}"#,
         )
         .expect_err("invalid timeout ordering must fail");
         assert!(
             error
                 .to_string()
-                .contains("acquire_timeout_ms + command_timeout_ms")
+                .contains("acquire_timeout_ms + 2 * command_timeout_ms")
         );
     }
 

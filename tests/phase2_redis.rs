@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use base64::Engine;
@@ -14,35 +13,16 @@ use serde_json::Value;
 use srh_rs::AppState;
 use srh_rs::adapters::auth_chain::AuthChain;
 use srh_rs::adapters::fred_executor::FredExecutor;
+use srh_rs::adapters::pool_manager::PoolManager;
 use srh_rs::adapters::static_auth::StaticAuth;
 use srh_rs::config::Config;
-use srh_rs::domain::resp::{AcquireError, PoolReadiness, RespValue};
-use srh_rs::ports::{
-    Authenticator, Clock, CommandExecutor, ExecutorHandle, ExecutorProvider, RedisCommand,
-};
+use srh_rs::domain::resp::{PoolReadiness, PoolReadinessStatus, RespValue};
+use srh_rs::ports::{Authenticator, Clock, CommandExecutor, ExecutorProvider, RedisCommand};
 use srh_rs::testsupport::executor_contract;
-use testcontainers::GenericImage;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
+use testcontainers::{GenericImage, ImageExt};
 use tower::ServiceExt;
-
-struct TestProvider {
-    executor: Arc<dyn CommandExecutor>,
-}
-
-#[async_trait]
-impl ExecutorProvider for TestProvider {
-    async fn acquire(&self, _pool: &str) -> Result<ExecutorHandle, AcquireError> {
-        Ok(ExecutorHandle::new(
-            Arc::clone(&self.executor),
-            Box::new(()),
-        ))
-    }
-
-    async fn readiness(&self) -> Vec<PoolReadiness> {
-        Vec::new()
-    }
-}
 
 struct TestClock;
 
@@ -58,9 +38,15 @@ impl Clock for TestClock {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn fred_executor_satisfies_contract_and_preserves_binary_values() {
+    let reservation = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("a host port should be reservable");
+    let fixed_host_port = reservation.local_addr().unwrap().port();
+    drop(reservation);
     let container = GenericImage::new("redis", "7")
         .with_exposed_port(6379.tcp())
         .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+        .with_mapped_port(fixed_host_port, 6379.tcp())
         .start()
         .await
         .expect("Redis 7 testcontainer should start");
@@ -93,16 +79,16 @@ async fn fred_executor_satisfies_contract_and_preserves_binary_values() {
     );
     let config = Arc::new(
         Config::from_json(&format!(
-            r#"{{"auth":{{"static_tokens":{{"right-token":{{"pool":"cache"}}}}}},"pools":{{"cache":{{"connection_string":"redis://127.0.0.1:{port}"}}}}}}"#
+            r#"{{"auth":{{"static_tokens":{{"right-token":{{"pool":"cache"}}}}}},"pools":{{"cache":{{"connection_string":"redis://127.0.0.1:{port}","max_connections":1}}}}}}"#
         ))
         .expect("HTTP test configuration should parse"),
     );
     let static_auth: Arc<dyn Authenticator> =
         Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
+    let manager = Arc::new(PoolManager::new(Arc::clone(&config), Arc::new(TestClock)));
+    let provider: Arc<dyn ExecutorProvider> = manager.clone();
     let app = srh_rs::http::router(AppState {
-        provider: Arc::new(TestProvider {
-            executor: Arc::clone(&executor),
-        }),
+        provider,
         authenticator: Arc::new(AuthChain::new(vec![static_auth])),
         clock: Arc::new(TestClock),
         cfg: config,
@@ -263,6 +249,142 @@ async fn fred_executor_satisfies_contract_and_preserves_binary_values() {
 
     pipeline_submission_order_survives_concurrent_load(Arc::clone(&executor)).await;
     transactions_remain_isolated_from_concurrent_commands(Arc::clone(&executor)).await;
+
+    assert_eq!(
+        manager.built_pool_count(),
+        1,
+        "HTTP requests reuse one lazy pool"
+    );
+    let saturated = manager.acquire("cache").await.unwrap();
+    assert_eq!(
+        manager.readiness().await,
+        vec![PoolReadiness {
+            pool: "cache".to_owned(),
+            status: PoolReadinessStatus::Ready,
+        }],
+        "a saturated healthy pool remains ready"
+    );
+    drop(saturated);
+    manager.shutdown().await;
+    fred_timeout_does_not_desynchronize_pooled_connection(port).await;
+
+    container.stop().await.expect("Redis container should stop");
+    let recovery_config = Arc::new(
+        Config::from_json(&format!(
+            r#"{{
+                "auth": {{"static_tokens": {{}}}},
+                "pools": {{"recovery": {{
+                    "connection_string": "redis://127.0.0.1:{port}",
+                    "max_connections": 1,
+                    "command_timeout_ms": 200,
+                    "acquire_timeout_ms": 500,
+                    "breaker": {{"failure_threshold": 100, "cooldown_ms": 100}}
+                }}}}
+            }}"#
+        ))
+        .expect("recovery test configuration should parse"),
+    );
+    let recovery = PoolManager::new(recovery_config, Arc::new(TestClock));
+    assert_eq!(recovery.built_pool_count(), 0);
+    assert!(recovery.readiness().await.is_empty());
+    let handle = recovery.acquire("recovery").await.unwrap();
+    assert!(
+        handle
+            .executor()
+            .execute(command("PING", &[]))
+            .await
+            .is_err(),
+        "a request while Redis is stopped must fail cleanly"
+    );
+    drop(handle);
+
+    container
+        .start()
+        .await
+        .expect("Redis container should restart");
+    let restarted_port = container
+        .get_host_port_ipv4(6379.tcp())
+        .await
+        .expect("restarted Redis port should be mapped");
+    assert_eq!(restarted_port, port);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("restarted Redis TCP listener should become reachable");
+    // The locked reconnect policy caps at five seconds; depending on where the
+    // container restart lands in the backoff sequence, the next attempt can be
+    // just past six seconds.
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let handle = recovery.acquire("recovery").await.unwrap();
+            let result = handle.executor().execute(command("PING", &[])).await;
+            drop(handle);
+            if result == Ok(RespValue::Simple("PONG".to_owned())) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("lazy pool should recover after Redis starts without a process restart");
+    recovery.shutdown().await;
+}
+
+async fn fred_timeout_does_not_desynchronize_pooled_connection(port: u16) {
+    let config = Arc::new(
+        Config::from_json(&format!(
+            r#"{{
+                "auth": {{"static_tokens": {{}}}},
+                "pools": {{"slow": {{
+                    "connection_string": "redis://127.0.0.1:{port}",
+                    "max_connections": 1,
+                    "command_timeout_ms": 100,
+                    "acquire_timeout_ms": 500
+                }}}}
+            }}"#
+        ))
+        .expect("timeout test configuration should parse"),
+    );
+    let manager = PoolManager::new(config, Arc::new(TestClock));
+    let handle = manager.acquire("slow").await.unwrap();
+    let results = handle
+        .executor()
+        .pipeline(
+            (0..8)
+                .map(|index| command("BLPOP", &[&format!("srh:timeout:missing:{index}"), "1"]))
+                .collect(),
+        )
+        .await;
+    assert!(
+        results
+            .iter()
+            .all(|result| *result == Err(srh_rs::domain::resp::ExecError::Timeout)),
+        "every blocking pipeline slot should time out"
+    );
+    drop(handle);
+
+    let recovery_started = Instant::now();
+    let handle = manager.acquire("slow").await.unwrap();
+    assert_eq!(
+        handle.executor().execute(command("PING", &[])).await,
+        Ok(RespValue::Simple("PONG".to_owned())),
+        "the request after a Fred-level timeout must receive its own reply"
+    );
+    assert!(
+        recovery_started.elapsed() < Duration::from_millis(200),
+        "one reset must recover an all-timeout pipeline before another command timeout"
+    );
+    drop(handle);
+    manager.shutdown().await;
 }
 
 async fn pipeline_submission_order_survives_concurrent_load(executor: Arc<dyn CommandExecutor>) {

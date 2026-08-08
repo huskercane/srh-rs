@@ -44,6 +44,9 @@ pub async fn execute(
         .execute(command)
         .await
         .map_err(map_exec_error)?;
+    // Redis work is complete; do not hold a scarce pool permit through
+    // potentially large response conversion.
+    drop(handle);
     let mut budget = state.cfg.server.load.max_response_bytes;
     let value = redis_value_to_json(value, response_encoding(&headers), &mut budget)?;
     Ok(Json(json!({ "result": value })).into_response())

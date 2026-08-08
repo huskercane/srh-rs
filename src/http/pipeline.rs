@@ -47,6 +47,9 @@ pub async fn execute(
         .await
         .map_err(|error| map_acquire_error(error, &state))?;
     let results = handle.executor().pipeline(commands).await;
+    // Redis work is complete; do not hold a scarce pool permit through
+    // potentially large response conversion.
+    drop(handle);
     let mut budget = state.cfg.server.load.max_response_bytes;
     let encoding = response_encoding(&headers);
     let response = results

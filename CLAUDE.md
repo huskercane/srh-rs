@@ -144,9 +144,13 @@ whole request with 502 on every endpoint.
 
 **Command timeouts are enforced inside fred, never by dropping the response future.**
 Dropping a future mid-command leaves an unconsumed RESP reply on a pooled connection and every
-later command on it reads the wrong reply. The tower `TimeoutLayer` is an HTTP backstop only.
-Startup must validate `acquire_timeout_ms + command_timeout_ms < http_timeout_ms` for every
-pool — the pairwise checks are insufficient.
+later command on it reads the wrong reply. Fred 10 does not always reset a responsive blocked
+socket after its caller timeout, so `FredExecutor` explicitly forces reconnection when Fred
+reports `ErrorKind::Timeout`, coalesced to one reset per request executor even when many
+pipeline slots time out together. The tower `TimeoutLayer` is an HTTP backstop only.
+Startup must validate
+`acquire_timeout_ms + 2 * command_timeout_ms < http_timeout_ms` for every pool: the second
+command-timeout budget covers the bounded forced reset after a Fred timeout.
 
 **The breaker is checked before any permit or waiter slot is taken**, in
 `PoolManager::acquire`, not in the decorator (the decorator only records outcomes). An open

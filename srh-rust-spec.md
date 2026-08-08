@@ -418,7 +418,7 @@ Rules:
   Plaintext keys are a dev/CI convenience; every EXAMPLE in docs and README uses
   `sha256:`, because examples get copied into production configs.
 - `command_timeout_ms` per pool, default 2000. **Startup invariant (validate, exit
-  on violation): `acquire_timeout_ms + command_timeout_ms < http_timeout_ms` for
+  on violation): `acquire_timeout_ms + 2 * command_timeout_ms < http_timeout_ms` for
   EVERY pool.** The pairwise checks (each < http_timeout) are insufficient: both can
   hold while the sum exceeds the HTTP timeout, in which case the tower TimeoutLayer
   fires mid-command, the handler future is dropped, and the permit guard drops with
@@ -430,15 +430,15 @@ Rules:
   `shed_retry_after_secs` 1; `body_read_timeout_ms` 2000. Per pool: `max_waiters`
   default 4 × `max_connections`;
   `acquire_timeout_ms` default 500 (the binding invariant is the SUM check above:
-  acquire + command < http_timeout, per pool);
+  acquire + command + reset < http_timeout, per pool);
   `breaker.failure_threshold` default 10 consecutive failures,
   `breaker.cooldown_ms` default 2000. All of these MUST be finite; a config value of
   0 for any bound is a startup validation error, not "unlimited".
 - **Timeout budgeting rule (README):** a client's worst case per logical operation is
-  `retries × (acquire_timeout_ms + command_timeout_ms)`. Size pool timeouts so that
-  the product fits inside the CALLER's deadline — e.g. an auth-refresh path with an
-  8s budget and an SDK doing 3 attempts needs ≤ ~1.25s per attempt (hence the
-  authkv example's 250 + 1000), not the general defaults' 2.5s.
+  `retries × (acquire_timeout_ms + 2 * command_timeout_ms)`. The second command
+  timeout covers the bounded forced reset. Size pool timeouts so that the product
+  fits inside the CALLER's deadline — e.g. the authkv example totals
+  250 + 2 × 1000 = 2250ms per attempt, not the general defaults' 4.5s.
 - **Rate sizing rule (README):** `per_token_commands_per_sec` is a COMMAND budget.
   Worst-case throttle after one max-size pipeline is
   `max_pipeline_commands / rate` seconds of debt — size the rate to cover the
@@ -585,7 +585,7 @@ must never be retried as a static token). Chain exhausted → 401. Phase 1 wires
 http/command.rs:
 1. `AuthedIdentity`; parse body `Vec<serde_json::Value>`; bad JSON/shape → 400.
 2. ACL check (Phase 5; permissive stub until then, marked `// TODO(phase5)`).
-3. Pool via PoolManager (Phase 4; per-request client until then, `// TODO(phase4)`).
+3. Pool via PoolManager (implemented in Phase 4).
 4. Send raw via fred custom-command API — never interpret the command.
 5. Redis error → 400 raw; success → 200, base64 per header.
 
@@ -709,7 +709,11 @@ struct PoolEntry {
   request burns `command_timeout_ms` holding a permit while Redis is down. After
   `cooldown_ms`, HalfOpen: exactly ONE request is
   allowed through as a probe (CAS on the state); probe success → Closed and reset the
-  failure counter, probe failure → Open with a fresh cooldown. Breaker state changes
+  failure counter, probe failure → Open with a fresh cooldown. Starting the probe also
+  restarts Fred's connection task so exponential reconnect backoff cannot extend recovery
+  beyond the breaker cooldown. While a backend remains down this deliberately produces one
+  reconnect attempt per cooldown rather than letting Fred remain at its 5s backoff cap.
+  Breaker state changes
   emit `tracing::warn!` and a metrics gauge.
 - Build: fred Pool from connection string, `max_connections`, RESP2 forced, rustls for
   `rediss://`, exponential reconnect (100ms–5s), NO ping at build (lazy connect —
@@ -718,11 +722,18 @@ struct PoolEntry {
   (`command_timeout_ms`) MUST be enforced inside fred (its command/response timeout
   config), NOT by racing/dropping the response future at the HTTP layer. Dropping a
   future mid-command leaves an unconsumed RESP reply on a pooled connection and every
-  subsequent command on that connection reads the wrong reply. On a fred-level timeout,
-  fred tears down and reconnects that connection — rely on that; never return a
-  connection to reuse after a timeout without reset. The tower `TimeoutLayer` remains
-  only as an HTTP backstop and is validated at startup to be strictly larger than every
-  pool's `command_timeout_ms`.
+  subsequent command on that connection reads the wrong reply. Fred 10 marks the command
+  timed out but does not necessarily tear down a responsive socket (for example, one
+  blocked in `BLPOP`), so the adapter MUST call `force_reconnection()` after a fred-level
+  timeout. Coalesce concurrent pipeline timeouts to at most one reset per request executor.
+  Never return a connection to reuse after a timeout without reset. The tower
+  `TimeoutLayer` remains only as an HTTP backstop; startup validates the full
+  acquire + command + reset budget described above.
+- `readiness()` PINGs only already-built pools but deliberately bypasses request permits,
+  waiter slots, and breaker admission. Readiness measures backend health, not saturation;
+  it must not remove a busy healthy instance from rotation or consume a half-open traffic
+  probe. It still uses Fred's bounded command timeout/reset path and does not touch idle
+  timestamps.
 - Background task (60s): evict entries idle > 900s via `pool.quit()`; also sweeps rate
   buckets (Phase 5). `tracing::info!` + metrics counter per eviction.
 

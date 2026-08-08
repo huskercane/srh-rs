@@ -63,7 +63,7 @@ impl IntoResponse for AppError {
                 retry_after_secs,
                 reason,
             } => {
-                tracing::warn!(%reason, retry_after_secs, "Redis circuit breaker is open");
+                tracing::debug!(%reason, retry_after_secs, "request rejected by open Redis circuit");
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Backend unavailable".to_owned(),

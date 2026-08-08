@@ -4,50 +4,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use async_trait::async_trait;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use srh_rs::adapters::auth_chain::AuthChain;
-use srh_rs::adapters::fred_executor::FredExecutor;
+use srh_rs::adapters::pool_manager::PoolManager;
 use srh_rs::adapters::static_auth::StaticAuth;
 use srh_rs::adapters::system_clock::SystemClock;
 use srh_rs::config::Config;
-use srh_rs::domain::resp::{AcquireError, PoolReadiness};
-use srh_rs::ports::{Authenticator, CommandExecutor, ExecutorHandle, ExecutorProvider};
+use srh_rs::ports::{Authenticator, Clock, ExecutorProvider};
 use srh_rs::{AppState, http};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
-
-struct PhaseTwoProvider {
-    config: Arc<Config>,
-}
-
-#[async_trait]
-impl ExecutorProvider for PhaseTwoProvider {
-    async fn acquire(&self, pool: &str) -> Result<ExecutorHandle, AcquireError> {
-        let pool_config = self
-            .config
-            .pools
-            .get(pool)
-            .ok_or_else(|| AcquireError::UnknownPool(pool.to_owned()))?;
-        let executor = FredExecutor::connect(
-            pool_config.connection_string.expose(),
-            Duration::from_millis(pool_config.acquire_timeout_ms),
-            Duration::from_millis(pool_config.command_timeout_ms),
-            self.config.server.max_pipeline_commands,
-        )
-        .await
-        .map_err(|error| AcquireError::Internal(error.to_string()))?;
-        let executor: Arc<dyn CommandExecutor> = Arc::new(executor);
-        Ok(ExecutorHandle::new(executor, Box::new(())))
-    }
-
-    async fn readiness(&self) -> Vec<PoolReadiness> {
-        Vec::new()
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -61,12 +30,13 @@ async fn main() -> Result<()> {
     let static_auth: Arc<dyn Authenticator> =
         Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
     let authenticator: Arc<dyn Authenticator> = Arc::new(AuthChain::new(vec![static_auth]));
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let pool_manager = Arc::new(PoolManager::new(Arc::clone(&config), Arc::clone(&clock)));
+    let provider: Arc<dyn ExecutorProvider> = pool_manager.clone();
     let state = AppState {
-        provider: Arc::new(PhaseTwoProvider {
-            config: Arc::clone(&config),
-        }),
+        provider,
         authenticator,
-        clock: Arc::new(SystemClock),
+        clock,
         cfg: Arc::clone(&config),
     };
     let address = bind_address(&config.server.bind, config.server.port);
@@ -85,6 +55,11 @@ async fn main() -> Result<()> {
     #[cfg(not(unix))]
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
+    let (maintenance_stop, maintenance_rx) = tokio::sync::watch::channel(false);
+    let maintenance = tokio::spawn(run_pool_maintenance(
+        Arc::clone(&pool_manager),
+        maintenance_rx,
+    ));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -119,8 +94,33 @@ async fn main() -> Result<()> {
     {
         tracing::error!("graceful shutdown deadline exceeded");
     }
-    // TODO(phase4): quit every constructed Redis pool after requests drain.
+    let _ = maintenance_stop.send(true);
+    if let Err(error) = maintenance.await {
+        tracing::error!(%error, "pool maintenance task failed");
+    }
+    pool_manager.shutdown().await;
     Ok(())
+}
+
+async fn run_pool_maintenance(
+    manager: Arc<PoolManager>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                manager.evict_idle().await;
+                // TODO(phase5): sweep idle rate-limit buckets in this task.
+            }
+            result = stop.changed() => {
+                if result.is_err() || *stop.borrow() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 fn initialize_tracing() {
