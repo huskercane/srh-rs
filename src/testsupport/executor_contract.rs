@@ -6,6 +6,12 @@ use crate::domain::resp::{ExecError, RespValue};
 use crate::ports::{CommandExecutor, RedisCommand};
 
 pub async fn executor_contract(executor: Arc<dyn CommandExecutor>) {
+    assert_eq!(
+        executor.transaction(Vec::new()).await,
+        Ok(Vec::new()),
+        "an empty transaction must be an explicit no-op"
+    );
+
     let raw_error = "WRONGTYPE Operation against a key holding the wrong kind of value";
     assert_eq!(
         executor
@@ -74,19 +80,7 @@ pub async fn executor_contract(executor: Arc<dyn CommandExecutor>) {
             "a failed transaction must not execute any queued command"
         );
     }
-}
 
-/// Semantics every `CommandExecutor` must share, which no implementation
-/// satisfies yet. These are the Phase 3 acceptance requirements; when the
-/// pipeline path stops converting through fred's lossy `Value`, fold this into
-/// [`executor_contract`] and delete it.
-///
-/// Both currently fail for `FredExecutor`:
-/// - a lowercase Redis error is classified `Transport`, which Phase 4's breaker
-///   would count as backend failure on a healthy server;
-/// - a bulk reply whose bytes are `OK` collapses to `Simple`, which §1.6 exempts
-///   from base64, so the value does not round-trip.
-pub async fn executor_contract_phase3(executor: Arc<dyn CommandExecutor>) {
     let lowercase = "boom lowercase failure";
     assert_eq!(
         executor
@@ -149,6 +143,9 @@ mod tests {
             )),
             Ok(RespValue::Nil),
             Ok(RespValue::Nil),
+            Err(ExecError::Redis("boom lowercase failure".to_owned())),
+            Ok(RespValue::Simple("OK".to_owned())),
+            Ok(RespValue::Bulk(Bytes::from_static(b"OK"))),
         ];
         executor_contract(Arc::new(FakeExecutor::new(replies))).await;
     }

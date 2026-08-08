@@ -117,7 +117,7 @@ verification must never be retried as a static token).
 
 ### Fakes are held to the same contract as real adapters
 
-`testsupport/` exposes `executor_contract(make: impl Fn() -> Arc<dyn CommandExecutor>)`,
+`testsupport/` exposes `executor_contract(executor: Arc<dyn CommandExecutor>)`,
 exercising raw-error passthrough, pipeline-never-aborts, transaction atomicity, and nil
 handling. The same suite runs against `FredExecutor` (testcontainers) and `FakeExecutor`
 (unit tests) — that is what makes fake-based unit tests trustworthy. Fakes are hand-written;
@@ -208,7 +208,7 @@ body must never hold a Redis permit.
 
 ## Current implementation status
 
-Phases 0–2 are complete. `POST /` authenticates, enforces the global admission stack, executes
-one Redis command, and converts the RESP2 result. Pipeline and transaction routes intentionally
-return 501 until Phase 3. Deferred work is marked with `TODO(phaseN)` comments where later phases
-attach to the current implementation.
+Phases 0–3 are complete. All three command routes authenticate, enforce the global admission
+stack, execute through Fred, and convert RESP2 results. Command ACL hooks remain permissive until
+Phase 5. Deferred work is marked with `TODO(phaseN)` comments where later phases attach to the
+current implementation.

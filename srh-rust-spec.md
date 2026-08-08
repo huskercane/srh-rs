@@ -28,6 +28,7 @@ tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["limit", "load-shed", "timeout", "util"] }
 tower-http = { version = "0.6", features = ["limit", "trace", "timeout"] }
 fred = { version = "10", features = ["enable-rustls-ring"] }
+futures-util = "0.3"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "server-graceful", "service", "tokio"] }
 serde = { version = "1", features = ["derive"] }
@@ -270,8 +271,13 @@ Single success → 200 `{"result": <converted reply>}`.
 Single Redis error → 400 `{"error":"<raw redis error incl. prefix>"}` (clients
 pattern-match these; do not rewrite).
 Pipeline → always 200, ordered `[{"result":..}|{"error":..}, ...]`.
-Multi-exec success → 200 array mapped 1:1 from EXEC reply. Queue/EXEC failure →
-DISCARD, then 400 `{"error":"<raw>"}`. Nil EXEC reply (aborted) → 400 pass-through.
+Non-Redis per-slot failures remain HTTP 200: timeout uses
+`{"error":"Redis command timed out"}` and transport failures use the redacted
+`{"error":"Internal server error"}`. These are synthetic application errors, not
+raw Redis errors, and transport details are logged server-side only.
+Multi-exec success → 200 array mapped 1:1 from EXEC reply. Queue-time failure →
+DISCARD, then 400 `{"error":"<raw>"}`. EXEC-time slot failure → 400 raw after
+Redis has executed the transaction; successful commands are not rolled back (§1.7).
 
 ### 1.5 RESP → JSON (`convert.rs::redis_value_to_json`)
 
@@ -304,6 +310,14 @@ Applies identically to all three endpoints.
 - `UNLINK` with 0 keys returns the real Redis error
 - `ZRANGE` requires BYSCORE/BYLEX for LIMIT
 - RedisJSON responses may differ subtly
+- Fred's public transaction API collapses valid UTF-8 bulk and simple strings into
+  the same `Value::String`. Therefore, in base64 mode only, a bulk value whose bytes
+  are exactly `OK` inside `/multi-exec` is returned as `"OK"` rather than `"T0s="`.
+  Single-command and pipeline execution use raw frames and do not have this divergence.
+- An EXEC-time command error does not roll back Redis transactions. `/multi-exec`
+  returns 400 with the raw failing-slot error and omits successful slot results,
+  but other queued commands may already have committed. `DISCARD` applies only to
+  queue-time failure before EXEC begins.
 
 ---
 
@@ -335,6 +349,7 @@ New format:
     "tls": null,
     "max_body_bytes": 10485760,
     "max_pipeline_commands": 1000,
+    "max_request_elements": 10000,
     "http_timeout_ms": 10000,
     "rate_limit": { "per_token_commands_per_sec": 0 },
     "load": {
@@ -600,12 +615,22 @@ http/command.rs:
 **pipeline.rs**: parse `Vec<Vec<serde_json::Value>>` (400 on shape). Enforce
 `max_pipeline_commands` → 400 `{"error":"Pipeline too large"}`. ACL-check every command
 UP FRONT; denied commands get their slot's `error` pre-filled and are NOT sent.
-Execute the remainder as a **real pipeline** (fred `Pipeline`, `try_all()`-style API
-that returns per-command results without aborting — verify exact method on docs.rs).
-Do NOT issue sequential awaited round-trips. Merge results back into original slot
-order. Always HTTP 200 — with ONE exception: `ResponseTooLarge` (budget exhaustion
+Execute the remainder by polling ordered `custom_raw` futures together with
+`futures_util::future::join_all`. Do NOT spawn one task per command: task scheduling
+can reorder dependent commands before they enter Fred's queue. The order-dependent
+integration test is the regression lock for Fred's first-poll enqueue behavior.
+Do NOT issue sequential awaited round-trips. Preserve original slot order. Always
+HTTP 200 — with ONE exception: `ResponseTooLarge` (budget exhaustion
 during conversion) fails the whole request with 502 per error.rs; see the caveat
 there about already-executed commands. Base64 per result.
+
+The outer pipeline array and inner command arrays use bounded serde `SeqAccess`
+visitors. `max_pipeline_commands` caps only the number of commands;
+`max_request_elements` (default 10,000) is a separate budget shared across every
+JSON value node and object key in the request, including nested array/object
+arguments. The node beyond the element budget is rejected before materialization;
+the command beyond the pipeline cap is consumed as `IgnoredAny`. Budget exhaustion
+returns 400 `{"error":"Request too complex"}`.
 
 **multi_exec.rs**: validate ALL commands (shape + ACL) before touching Redis; any
 failure → 400 with first error, nothing sent. Use fred's transaction API — and
@@ -614,8 +639,8 @@ single connection such that no other request's commands can interleave between M
 and EXEC** (fred multiplexes and the Pool round-robins; the semaphore bounds
 requests, NOT connections, so nothing in srh-rs's own design prevents interleaving —
 the guarantee must come from fred's transaction implementation, and the test below
-proves it rather than assumes it). Runtime failure → DISCARD + 400 raw. Success →
-200 mapped array.
+proves it rather than assumes it). Queue-time failure → DISCARD + 400 raw;
+EXEC-time slot failure → 400 raw with no rollback (§1.7). Success → 200 mapped array.
 
 ### Phase 3 acceptance
 - Pipeline, failing middle command: 200; slot 1 error, slots 0/2 succeed.

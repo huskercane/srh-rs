@@ -16,6 +16,7 @@ base64 = "0.22"
 bytes = "1"
 dashmap = "6"
 fred = { version = "10", features = ["enable-rustls-ring"] }
+futures-util = "0.3"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "server-graceful", "service", "tokio"] }
 jsonwebtoken = "9"

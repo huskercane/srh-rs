@@ -13,9 +13,9 @@ Wire compatibility with the `@upstash/redis` SDK is the top-level design require
 
 > ### Status: specification-complete, implementation in progress
 >
-> Phases 0–2 are implemented: the architecture scaffold, configuration, static-token
-> authentication, admission controls, RESP conversion, and single-command Redis execution are
-> working. Pipeline and transaction routes remain deferred to Phase 3. The normative
+> Phases 0–3 are implemented: the architecture scaffold, configuration, static-token
+> authentication, admission controls, RESP conversion, and all three Redis execution routes are
+> working. Command ACLs remain permissive until Phase 5. The normative
 > specification is [`srh-rust-spec.md`](./srh-rust-spec.md), which defines ten phases; this
 > README documents the system that spec describes.
 >
@@ -24,7 +24,7 @@ Wire compatibility with the `@upstash/redis` SDK is the top-level design require
 > | 0 | Project setup, hexagonal skeleton, ports | Done |
 > | 1 | Config, errors, static auth, HTTP skeleton | Done |
 > | 2 | RESP↔JSON conversion, `POST /` | Done |
-> | 3 | `POST /pipeline`, `POST /multi-exec` | Not started |
+> | 3 | `POST /pipeline`, `POST /multi-exec` | Done |
 > | 4 | Lazy pools, timeouts, circuit breaker, eviction | Not started |
 > | 5 | Command ACLs, rate limiting | Not started |
 > | 6 | Keycloak JWT auth, JWKS, introspection | Not started |
@@ -188,6 +188,10 @@ These are intentional and will not be "fixed":
 - `UNLINK` with zero keys returns the real Redis error rather than a synthesized success.
 - `ZRANGE` requires `BYSCORE` or `BYLEX` in order to use `LIMIT`.
 - RedisJSON responses may differ subtly.
+- In base64 mode, a bulk value containing exactly `OK` inside `/multi-exec` is returned as
+  `"OK"`, not `"T0s="`. Fred's public transaction API does not preserve simple-vs-bulk framing.
+- Redis transactions do not roll back commands after an EXEC-time command error. The endpoint
+  returns 400 with that error and omits successful slot results, but other commands may commit.
 
 ---
 
@@ -246,6 +250,7 @@ behavior. They are the only identities exempt from the default block set below.
     "tls": null,
     "max_body_bytes": 10485760,
     "max_pipeline_commands": 1000,
+    "max_request_elements": 10000,
     "http_timeout_ms": 10000,
     "rate_limit": { "per_token_commands_per_sec": 0 },
     "load": {
@@ -313,7 +318,10 @@ printf %s 'your_token_here' | sha256sum
 **Defaults.** `command_timeout_ms` 2000, `acquire_timeout_ms` 500, `max_waiters` 4 ×
 `max_connections`, `breaker.failure_threshold` 10 consecutive failures,
 `breaker.cooldown_ms` 2000. Every bound must be finite: `0` is a startup validation error,
-never "unlimited".
+never "unlimited". `max_pipeline_commands` bounds commands in a pipeline;
+`max_request_elements` independently bounds all JSON value nodes and object keys across one
+request, including nested array/object arguments. A single large MGET can therefore use the
+whole element budget without raising the pipeline command cap.
 
 **`server.tls`** takes `{cert, key}` paths and is optional; absent means plain HTTP. TLS here
 is low priority — the intended deployment terminates TLS at a reverse proxy.

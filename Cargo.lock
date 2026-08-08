@@ -1956,6 +1956,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "fred",
+ "futures-util",
  "hyper",
  "hyper-util",
  "jsonwebtoken",

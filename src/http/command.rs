@@ -20,8 +20,17 @@ pub async fn execute(
     request: Request,
 ) -> Result<Response, AppError> {
     let body = read_body(&state, request).await?;
-    let values: Vec<serde_json::Value> = serde_json::from_slice(&body)
-        .map_err(|_| AppError::BadRequest("Invalid command".to_owned()))?;
+    let values =
+        super::parse::command(&body, state.cfg.server.max_request_elements).map_err(|error| {
+            match error {
+                super::parse::ParseError::RequestTooComplex => {
+                    AppError::BadRequest("Request too complex".to_owned())
+                }
+                super::parse::ParseError::Invalid | super::parse::ParseError::PipelineTooLarge => {
+                    AppError::BadRequest("Invalid command".to_owned())
+                }
+            }
+        })?;
     let command = json_args_to_redis(&values)?;
 
     // TODO(phase5): apply command ACLs before acquiring a pool.
@@ -40,22 +49,10 @@ pub async fn execute(
     Ok(Json(json!({ "result": value })).into_response())
 }
 
-pub async fn not_implemented(
-    identity: AuthedIdentity,
-    State(state): State<AppState>,
+pub(super) async fn read_body(
+    state: &AppState,
     request: Request,
-) -> Result<Response, AppError> {
-    // TODO(phase3): replace this authenticated stub with pipeline/transaction execution.
-    let _identity = identity.0;
-    read_body(&state, request).await?;
-    Ok((
-        axum::http::StatusCode::NOT_IMPLEMENTED,
-        Json(json!({ "error": "Not implemented" })),
-    )
-        .into_response())
-}
-
-async fn read_body(state: &AppState, request: Request) -> Result<bytes::Bytes, AppError> {
+) -> Result<bytes::Bytes, AppError> {
     tokio::time::timeout(
         Duration::from_millis(state.cfg.server.load.body_read_timeout_ms),
         to_bytes(request.into_body(), state.cfg.server.max_body_bytes),
@@ -65,7 +62,7 @@ async fn read_body(state: &AppState, request: Request) -> Result<bytes::Bytes, A
     .map_err(|_| AppError::BadRequest("Invalid command".to_owned()))
 }
 
-fn response_encoding(headers: &HeaderMap) -> Encoding {
+pub(super) fn response_encoding(headers: &HeaderMap) -> Encoding {
     headers
         .get("upstash-encoding")
         .and_then(|value| value.to_str().ok())
@@ -73,7 +70,7 @@ fn response_encoding(headers: &HeaderMap) -> Encoding {
         .map_or(Encoding::None, |_| Encoding::Base64)
 }
 
-fn map_exec_error(error: ExecError) -> AppError {
+pub(super) fn map_exec_error(error: ExecError) -> AppError {
     match error {
         ExecError::Redis(message) => AppError::RedisError(message),
         ExecError::ResponseTooLarge => AppError::ResponseTooLarge,
@@ -82,7 +79,7 @@ fn map_exec_error(error: ExecError) -> AppError {
     }
 }
 
-fn map_acquire_error(error: AcquireError, state: &AppState) -> AppError {
+pub(super) fn map_acquire_error(error: AcquireError, state: &AppState) -> AppError {
     match error {
         AcquireError::UnknownPool(pool) => {
             AppError::Internal(format!("identity referenced unknown Redis pool '{pool}'"))

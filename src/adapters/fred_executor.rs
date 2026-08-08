@@ -6,6 +6,7 @@ use fred::error::{Error, ErrorKind};
 use fred::interfaces::{ClientLike, TransactionInterface};
 use fred::types::config::{Config, ConnectionConfig, PerformanceConfig, ReconnectPolicy};
 use fred::types::{ClusterHash, ConnectHandle, CustomCommand, Resp3Frame, RespVersion, Value};
+use futures_util::future::join_all;
 
 use crate::domain::convert::MAX_DEPTH;
 use crate::domain::resp::{ExecError, RespValue};
@@ -60,7 +61,7 @@ impl FredExecutor {
 
 impl Drop for FredExecutor {
     fn drop(&mut self) {
-        // Phase 2 creates one client per request. Aborting prevents detached
+        // Phases 2–3 create one client per request. Aborting prevents detached
         // reconnect tasks; Phase 4 replaces this with long-lived pools + quit().
         self.connection_task.abort();
     }
@@ -79,24 +80,15 @@ impl CommandExecutor for FredExecutor {
     }
 
     async fn pipeline(&self, commands: Vec<RedisCommand>) -> Vec<Result<RespValue, ExecError>> {
-        let count = commands.len();
-        let pipeline = self.client.pipeline();
-        for command in commands {
-            let (command, args) = Self::command(command);
-            if let Err(error) = pipeline.custom::<Value, _>(command, args).await {
-                let error = map_fred_error(error);
-                return vec![Err(error); count];
-            }
-        }
-        pipeline
-            .try_all::<Value>()
-            .await
-            .into_iter()
-            .map(|result| result.map_err(map_fred_error).and_then(fred_value_to_resp))
-            .collect()
+        // Poll in request order on one task. Fred enqueues each command on its
+        // first poll; spawning per command can reorder dependent commands.
+        join_all(commands.into_iter().map(|command| self.execute(command))).await
     }
 
     async fn transaction(&self, commands: Vec<RedisCommand>) -> Result<Vec<RespValue>, ExecError> {
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
         let transaction = self.client.multi();
         for command in commands {
             let (command, args) = Self::command(command);
@@ -105,7 +97,10 @@ impl CommandExecutor for FredExecutor {
                 .await
                 .map_err(map_fred_error)?;
         }
-        let value: Value = transaction.exec(true).await.map_err(map_fred_error)?;
+        let value: Value = transaction
+            .exec(true)
+            .await
+            .map_err(map_fred_response_error)?;
         match fred_value_to_resp(value)? {
             RespValue::Array(values) => Ok(values),
             RespValue::Nil => Err(ExecError::Redis(
@@ -125,9 +120,9 @@ fn value_within_depth(value: Value, depth_remaining: usize) -> Result<RespValue,
         .checked_sub(1)
         .ok_or(ExecError::ResponseTooLarge)?;
     match value {
-        // TODO(phase3): preserve simple-vs-bulk framing in pipeline/EXEC replies.
-        // Fred's high-level Value merges valid UTF-8 forms; custom_raw avoids
-        // that loss for the Phase 2 single-command endpoint.
+        // Fred's public transaction API collapses simple and valid UTF-8 bulk
+        // strings into Value::String before returning. See the documented
+        // multi-exec/base64 `OK` divergence in §1.7.
         Value::String(value) if value.as_bytes() == b"OK" => {
             Ok(RespValue::Simple(value.to_string()))
         }
@@ -196,6 +191,14 @@ fn map_fred_error(error: Error) -> ExecError {
         ExecError::Timeout
     } else {
         ExecError::Transport(error.to_string())
+    }
+}
+
+fn map_fred_response_error(error: Error) -> ExecError {
+    if error.kind() == &ErrorKind::Unknown {
+        ExecError::Redis(error.details().to_owned())
+    } else {
+        map_fred_error(error)
     }
 }
 
@@ -280,6 +283,14 @@ mod tests {
         );
         assert!(matches!(
             map_fred_error(Error::new(ErrorKind::IO, "connection reset")),
+            ExecError::Transport(_)
+        ));
+        assert_eq!(
+            map_fred_response_error(Error::new(ErrorKind::Unknown, "boom lowercase failure")),
+            ExecError::Redis("boom lowercase failure".to_owned())
+        );
+        assert!(matches!(
+            map_fred_response_error(Error::new(ErrorKind::IO, "connection reset")),
             ExecError::Transport(_)
         ));
     }

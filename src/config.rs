@@ -49,6 +49,7 @@ pub struct ServerConfig {
     pub tls: Option<TlsConfig>,
     pub max_body_bytes: usize,
     pub max_pipeline_commands: usize,
+    pub max_request_elements: usize,
     pub http_timeout_ms: u64,
     pub rate_limit: RateLimitConfig,
     pub load: LoadConfig,
@@ -351,6 +352,10 @@ impl Config {
             "server.max_pipeline_commands",
             self.server.max_pipeline_commands,
         )?;
+        validate_nonzero(
+            "server.max_request_elements",
+            self.server.max_request_elements,
+        )?;
         validate_nonzero("server.http_timeout_ms", self.server.http_timeout_ms)?;
         validate_nonzero("server.load.max_in_flight", self.server.load.max_in_flight)?;
         validate_nonzero(
@@ -436,6 +441,7 @@ impl Default for ServerConfig {
             tls: None,
             max_body_bytes: 10_485_760,
             max_pipeline_commands: 1_000,
+            max_request_elements: 10_000,
             http_timeout_ms: 10_000,
             rate_limit: RateLimitConfig {
                 per_token_commands_per_sec: 0,
@@ -630,6 +636,7 @@ struct RawServerConfig {
     tls: Option<TlsConfig>,
     max_body_bytes: usize,
     max_pipeline_commands: usize,
+    max_request_elements: usize,
     http_timeout_ms: u64,
     rate_limit: RawRateLimitConfig,
     load: RawLoadConfig,
@@ -645,6 +652,7 @@ impl Default for RawServerConfig {
             tls: server.tls,
             max_body_bytes: server.max_body_bytes,
             max_pipeline_commands: server.max_pipeline_commands,
+            max_request_elements: server.max_request_elements,
             http_timeout_ms: server.http_timeout_ms,
             rate_limit: RawRateLimitConfig::default(),
             load: RawLoadConfig::default(),
@@ -661,6 +669,7 @@ impl From<RawServerConfig> for ServerConfig {
             tls: raw.tls,
             max_body_bytes: raw.max_body_bytes,
             max_pipeline_commands: raw.max_pipeline_commands,
+            max_request_elements: raw.max_request_elements,
             http_timeout_ms: raw.http_timeout_ms,
             rate_limit: raw.rate_limit.into(),
             load: raw.load.into(),
@@ -890,6 +899,18 @@ mod tests {
         );
         assert!(token.blocked_commands.contains("SET"));
         assert!(!token.legacy);
+    }
+
+    #[test]
+    fn request_element_budget_is_independent_and_nonzero() {
+        let config = Config::from_json(r#"{"server":{"max_request_elements":5001}}"#)
+            .expect("request element budget should parse");
+        assert_eq!(config.server.max_request_elements, 5001);
+        assert_eq!(config.server.max_pipeline_commands, 1000);
+
+        let error = Config::from_json(r#"{"server":{"max_request_elements":0}}"#)
+            .expect_err("request element budget must be finite and nonzero");
+        assert!(error.to_string().contains("max_request_elements"));
     }
 
     #[test]

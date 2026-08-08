@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const FORBIDDEN_CRATES: [&str; 5] = ["fred", "axum", "reqwest", "hyper", "tower"];
+const FORBIDDEN_CRATES: [&str; 6] = ["fred", "axum", "reqwest", "hyper", "tower", "futures_util"];
 
 #[test]
 fn domain_and_ports_do_not_reference_adapter_dependencies() {
