@@ -367,7 +367,7 @@ impl Config {
         )?;
 
         if let Some(jwt) = &self.auth.jwt {
-            let issuer = reqwest::Url::parse(&jwt.issuer).map_err(|error| {
+            let issuer = url::Url::parse(&jwt.issuer).map_err(|error| {
                 ConfigError::Validation(format!("auth.jwt.issuer is not a valid URL: {error}"))
             })?;
             if !matches!(issuer.scheme(), "http" | "https") {

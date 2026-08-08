@@ -14,6 +14,10 @@ This Rust 2024 crate implements an Upstash-compatible Redis HTTP proxy. Keep the
 
 Preserve the dependency rule: `domain` and `ports` must not import Axum, Fred, Reqwest, Hyper, or Tower. Concrete adapter types should be named only in their module and in `main.rs`.
 
+## Dependency Policy
+
+Use `hyper` and `hyper-util` directly for all outbound HTTP work, including the Phase 6 JWKS and introspection adapters. Do not add `reqwest` to dependencies, dev-dependencies, tests, or source code. Keep TLS on the existing rustls `ring` provider and verify feature unification with `cargo tree -e features -i rustls` after changing networking dependencies. Use the standalone `url` crate when URL parsing is needed.
+
 ## Build, Test, and Development Commands
 
 The pinned Rust 1.97 toolchain is selected through `rust-toolchain.toml`.

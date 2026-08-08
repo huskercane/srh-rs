@@ -63,7 +63,7 @@ are the rules that require reading several files to reconstruct:
 
 ### The dependency rule
 
-`domain/` imports only std, `serde_json`, `bytes`, `sha2`, and `ports/` types — never fred,
+`domain/` imports only std, `serde_json`, `bytes`, `base64`, `sha2`, and `ports/` types — never fred,
 axum, tower, hyper, or reqwest (tokio sync primitives such as `Semaphore` and atomics are
 allowed; tokio I/O is not). `ports/` imports only domain types. `adapters/` and `http/` may
 import anything. **`main.rs` is the only place a concrete adapter type is named outside its
@@ -71,7 +71,25 @@ own module.**
 
 `tests/dependency_rule.rs` enforces this for imports and fully-qualified paths while ignoring
 comments and Rust string/character literals. Treat a green run as necessary, not sufficient;
-the single-crate layout cannot make the dependency boundary compiler-enforced.
+the single-crate layout cannot make the dependency boundary compiler-enforced. `reqwest` stays
+in its forbidden list even though the crate is gone — the entry is now a tripwire against
+reintroduction (see below).
+
+### HTTP clients use hyper — never add reqwest
+
+Outbound HTTP uses `hyper` directly, which is already a dependency for the inbound listener.
+Do not add `reqwest` back, in this repo or elsewhere in Rust work here. Phase 6 (JWKS and
+token introspection) is the only phase needing a client; it adds `hyper/client`,
+`hyper-util` (`client`, `client-legacy` for pooling), `hyper-rustls`, and `http-body-util`
+**at that point**, not in advance — an unused dependency carried across phases is exactly
+how the rustls dual-provider panic got in.
+
+Pair `hyper-rustls` with `rustls-native-certs`, not `webpki-roots`. fred already trusts the
+OS store, and a client on bundled Mozilla roots fails against a Keycloak behind an internal
+CA with an unknown-issuer error that installing the CA system-wide does not fix.
+
+For URL parsing alone use the `url` crate (`config.rs` validates `auth.jwt.issuer` with it);
+never pull an HTTP client to parse a string.
 
 ### Exactly six ports
 
