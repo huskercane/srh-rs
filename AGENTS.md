@@ -47,7 +47,7 @@ A green suite is necessary, not sufficient. `tests/mutation_guard.rs` breaks one
 cargo test --test mutation_guard -- --ignored --nocapture
 ```
 
-It takes about three minutes on a warm cache, needs no Docker, and never touches the working tree — the scratch copy and its build artifacts live under `target/mutation-guard/`.
+It takes about six minutes on a warm cache, needs no Docker, and never touches the working tree — the scratch copy and its build artifacts live under `target/mutation-guard/`.
 
 When you add a regression lock, add the mutation it is supposed to kill. Three rules keep the sweep honest:
 

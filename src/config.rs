@@ -120,8 +120,7 @@ pub struct PoolConfig {
     pub acquire_timeout_ms: u64,
     pub max_waiters: usize,
     pub breaker: BreakerConfig,
-    // TODO(phase6): merge this server-controlled widening policy into every JWT identity routed
-    // to the pool, matching the static-token normalization performed in `from_new_value`.
+    // Server-controlled widening policy copied into every identity routed to this pool.
     pub allowed_script_sha256: HashSet<String>,
 }
 
@@ -387,6 +386,35 @@ impl Config {
                 return Err(ConfigError::Validation(
                     "auth.jwt.issuer must use http or https".to_owned(),
                 ));
+            }
+            if jwt.audience.is_empty() || jwt.client_id.is_empty() {
+                return Err(ConfigError::Validation(
+                    "auth.jwt.audience and auth.jwt.client_id must not be empty".to_owned(),
+                ));
+            }
+            validate_nonzero("auth.jwt.jwks_refresh_secs", jwt.jwks_refresh_secs)?;
+            if jwt.introspection.enabled {
+                let endpoint = url::Url::parse(&jwt.introspection.url).map_err(|error| {
+                    ConfigError::Validation(format!(
+                        "auth.jwt.introspection.url is not a valid URL: {error}"
+                    ))
+                })?;
+                if !matches!(endpoint.scheme(), "http" | "https") {
+                    return Err(ConfigError::Validation(
+                        "auth.jwt.introspection.url must use http or https".to_owned(),
+                    ));
+                }
+                if jwt.introspection.client_id.is_empty()
+                    || jwt.introspection.client_secret.expose().is_empty()
+                {
+                    return Err(ConfigError::Validation(
+                        "enabled JWT introspection requires client_id and client_secret".to_owned(),
+                    ));
+                }
+                validate_nonzero(
+                    "auth.jwt.introspection.cache_secs",
+                    jwt.introspection.cache_secs,
+                )?;
             }
         }
 
@@ -964,6 +992,22 @@ mod tests {
         let token = &config.auth.static_tokens[&digest_token("token")];
         assert!(token.allowed_script_sha256.contains("1234"));
         assert!(token.allowed_script_sha256.contains("abcdef"));
+    }
+
+    #[test]
+    fn validates_jwt_and_enabled_introspection_bounds() {
+        for json in [
+            r#"{"auth":{"jwt":{"issuer":"https://issuer.test","audience":"","client_id":"srh"}}}"#,
+            r#"{"auth":{"jwt":{"issuer":"https://issuer.test","audience":"srh","client_id":"srh","jwks_refresh_secs":0}}}"#,
+            r#"{"auth":{"jwt":{"issuer":"https://issuer.test","audience":"srh","client_id":"srh","introspection":{"enabled":true,"url":"file:///secret","client_id":"client","client_secret":"secret"}}}}"#,
+            r#"{"auth":{"jwt":{"issuer":"https://issuer.test","audience":"srh","client_id":"srh","introspection":{"enabled":true,"url":"https://issuer.test/introspect","client_id":"client","client_secret":"secret","cache_secs":0}}}}"#,
+        ] {
+            assert!(Config::from_json(json).is_err(), "must reject {json}");
+        }
+        Config::from_json(
+            r#"{"auth":{"jwt":{"issuer":"https://issuer.test","audience":"srh","client_id":"srh","introspection":{"enabled":true,"url":"https://issuer.test/introspect","client_id":"client","client_secret":"secret","cache_secs":30}}}}"#,
+        )
+        .expect("complete JWT introspection configuration should validate");
     }
 
     #[test]

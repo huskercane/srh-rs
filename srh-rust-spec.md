@@ -9,7 +9,7 @@ acceptance criteria; do not proceed until they pass. Do not invent features not 
 spec. Wire compatibility with the `@upstash/redis` JavaScript SDK is the top-level
 requirement — where the spec says "exactly", match exactly.
 
-**Implementation status (2026-08-08):** Phases 0–5 are complete. Phase 6 is next; Phase 8
+**Implementation status (2026-08-08):** Phases 0–6 are complete. Phase 7 is next; Phase 8
 remains deferred as specified.
 
 **API-name caution:** dependency APIs change between versions. Type/method names in this

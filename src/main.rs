@@ -9,12 +9,15 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use srh_rs::adapters::auth_chain::AuthChain;
+use srh_rs::adapters::http_introspect::HttpIntrospector;
+use srh_rs::adapters::http_jwks::HttpJwks;
+use srh_rs::adapters::jwt_auth::JwtAuth;
 use srh_rs::adapters::pool_manager::PoolManager;
 use srh_rs::adapters::static_auth::StaticAuth;
 use srh_rs::adapters::system_clock::SystemClock;
 use srh_rs::config::Config;
 use srh_rs::domain::rate_limit::RateLimiter;
-use srh_rs::ports::{Authenticator, Clock, ExecutorProvider};
+use srh_rs::ports::{Authenticator, Clock, ExecutorProvider, Introspector, JwksSource};
 use srh_rs::{AppState, http};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -28,10 +31,44 @@ async fn main() -> Result<()> {
     }
     warn_for_insecure_public_bind(&config.server.bind);
 
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let static_auth: Arc<dyn Authenticator> =
         Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
-    let authenticator: Arc<dyn Authenticator> = Arc::new(AuthChain::new(vec![static_auth]));
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let (jwt_auth, authenticator): (Option<Arc<JwtAuth>>, Arc<dyn Authenticator>) =
+        if let Some(jwt_config) = config.auth.jwt.clone() {
+            let jwks: Arc<dyn JwksSource> = Arc::new(
+                HttpJwks::new(jwt_config.issuer.clone(), jwt_config.jwks_refresh_secs)
+                    .map_err(anyhow::Error::msg)
+                    .context("failed to initialize JWKS client")?,
+            );
+            let introspector: Option<Arc<dyn Introspector>> = if jwt_config.introspection.enabled {
+                Some(Arc::new(
+                    HttpIntrospector::new(
+                        jwt_config.introspection.url.clone(),
+                        &jwt_config.introspection.client_id,
+                        &jwt_config.introspection.client_secret,
+                    )
+                    .map_err(anyhow::Error::msg)
+                    .context("failed to initialize introspection client")?,
+                ))
+            } else {
+                None
+            };
+            let jwt = Arc::new(JwtAuth::new(
+                jwt_config,
+                &config.pools,
+                jwks,
+                introspector,
+                Arc::clone(&clock),
+            ));
+            let jwt_link: Arc<dyn Authenticator> = jwt.clone();
+            (
+                Some(Arc::clone(&jwt)),
+                Arc::new(AuthChain::new(vec![jwt_link, static_auth])),
+            )
+        } else {
+            (None, Arc::new(AuthChain::new(vec![static_auth])))
+        };
     let rate_limiter = Arc::new(RateLimiter::new(
         config.server.rate_limit.per_token_commands_per_sec,
         Arc::clone(&clock),
@@ -65,6 +102,7 @@ async fn main() -> Result<()> {
     let maintenance = tokio::spawn(run_pool_maintenance(
         Arc::clone(&pool_manager),
         rate_limiter,
+        jwt_auth,
         maintenance_rx,
         Duration::from_secs(60),
     ));
@@ -113,6 +151,7 @@ async fn main() -> Result<()> {
 async fn run_pool_maintenance(
     manager: Arc<PoolManager>,
     rate_limiter: Arc<RateLimiter>,
+    jwt_auth: Option<Arc<JwtAuth>>,
     mut stop: tokio::sync::watch::Receiver<bool>,
     period: Duration,
 ) {
@@ -127,6 +166,16 @@ async fn run_pool_maintenance(
                     Ok(evicted) if evicted > 0 => tracing::info!(evicted, "evicted idle rate-limit buckets"),
                     Ok(_) => {}
                     Err(error) => tracing::error!(%error, "rate-limit maintenance failed"),
+                }
+                if let Some(jwt) = &jwt_auth {
+                    let jwt = Arc::clone(jwt);
+                    match tokio::task::spawn_blocking(move || jwt.sweep_introspection_cache()).await {
+                        Ok(evicted) if evicted > 0 => {
+                            tracing::info!(evicted, "evicted expired introspection results");
+                        }
+                        Ok(_) => {}
+                        Err(error) => tracing::error!(%error, "introspection maintenance failed"),
+                    }
                 }
             }
             result = stop.changed() => {
@@ -243,6 +292,7 @@ mod tests {
         let task = tokio::spawn(run_pool_maintenance(
             manager,
             Arc::clone(&limiter),
+            None,
             receiver,
             Duration::from_secs(3_600),
         ));

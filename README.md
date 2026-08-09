@@ -13,10 +13,11 @@ Wire compatibility with the `@upstash/redis` SDK is the top-level design require
 
 > ### Status: specification-complete, implementation in progress
 >
-> Phases 0–5 are implemented: the architecture scaffold, configuration, static-token
+> Phases 0–6 are implemented: the architecture scaffold, configuration, static-token and JWT
 > authentication, admission controls, RESP conversion, and all three Redis execution routes are
 > working with lazy bounded pools, Fred-level timeouts, circuit breaking, idle eviction,
-> command ACL enforcement, script allowlisting, and debt-aware per-credential rate limiting.
+> command ACL enforcement, script allowlisting, debt-aware per-credential rate limiting,
+> bounded JWKS discovery, and optional token introspection.
 > The normative
 > specification is [`srh-rust-spec.md`](./srh-rust-spec.md), which defines ten phases; this
 > README documents the system that spec describes.
@@ -29,7 +30,7 @@ Wire compatibility with the `@upstash/redis` SDK is the top-level design require
 > | 3 | `POST /pipeline`, `POST /multi-exec` | Done |
 > | 4 | Lazy pools, timeouts, circuit breaker, eviction | Done |
 > | 5 | Command ACLs, rate limiting | Done |
-> | 6 | Keycloak JWT auth, JWKS, introspection | Not started |
+> | 6 | Keycloak JWT auth, JWKS, introspection | Done |
 > | 7 | Hardening, observability, packaging | Not started |
 > | 8 | Key-prefix isolation | Deferred — out of the first delivery |
 > | 9 | Load-handling verification | Not started |
@@ -498,9 +499,14 @@ closes algorithm-confusion attacks including `none` and HS256-signed-with-a-publ
 entries that are not signing keys are ignored — Keycloak publishes RSA encryption keys in the
 same document, and ingesting one produces baffling failures on `kid` collision.
 
+OpenID discovery and JWKS retrieval are lazy and use a pooled Hyper client over rustls with the
+ring provider and native OS trust roots. Responses and timeouts are bounded, redirects are
+rejected, and an unknown `kid` can force at most one refresh every 30 seconds.
+
 **Token introspection** (RFC 7662) is available and off by default. When enabled, an inactive
 token is a 401 and an unreachable introspection endpoint is a 503 — enabling it means choosing
-revocation over availability.
+revocation over availability. Results are cached by the token's SHA-256 digest in a bounded
+100,000-entry LRU and expired entries are removed by the shared maintenance task.
 
 **Break-glass.** Deployments using JWT as the primary path should configure one
 high-entropy static `sha256:` token, tightly scoped to its own pool and `allowed_commands`,
@@ -622,7 +628,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 Before tagging a release, also run the mutation sweep, which breaks one invariant at a time in a
 scratch copy of the crate and asserts that some test notices. It is `#[ignore]`d so that CI skips
-it, takes about three minutes on a warm cache, and needs no Docker:
+it, takes about six minutes on a warm cache, and needs no Docker:
 
 ```bash
 cargo test --test mutation_guard -- --ignored --nocapture

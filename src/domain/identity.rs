@@ -81,6 +81,7 @@ macro_rules! string_error {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuthError {
     Rejected,
+    Forbidden(String),
     ServiceUnavailable(String),
 }
 
@@ -88,12 +89,30 @@ impl Display for AuthError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Rejected => formatter.write_str("authentication rejected"),
-            Self::ServiceUnavailable(message) => formatter.write_str(message),
+            Self::Forbidden(message) | Self::ServiceUnavailable(message) => {
+                formatter.write_str(message)
+            }
         }
     }
 }
 
 impl Error for AuthError {}
 
-string_error!(JwksError);
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum JwksError {
+    NotFound,
+    Unavailable(String),
+}
+
+impl Display for JwksError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound => formatter.write_str("no matching signing key"),
+            Self::Unavailable(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl Error for JwksError {}
+
 string_error!(IntrospectError);

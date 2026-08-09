@@ -15,7 +15,7 @@
 //!
 //! The sweep never touches the working tree. It copies the crate (minus `target/` and VCS
 //! directories) into `target/mutation-guard/tree`, applies one mutation at a time there, and runs
-//! that copy's `cargo test` with its own `CARGO_TARGET_DIR`. Expect about three minutes once
+//! that copy's `cargo test` with its own `CARGO_TARGET_DIR`. Expect about six minutes once
 //! the scratch target directory is warm, and a few more on the first run.
 //!
 //! ## Adding a mutation
@@ -51,6 +51,9 @@ const MULTI_EXEC: &str = "src/http/multi_exec.rs";
 const EXTRACTORS: &str = "src/http/extractors.rs";
 const MAIN: &str = "src/main.rs";
 const PORTS: &str = "src/ports/mod.rs";
+const JWT_AUTH: &str = "src/adapters/jwt_auth.rs";
+const HTTP_JWKS: &str = "src/adapters/http_jwks.rs";
+const OUTBOUND_HTTP: &str = "src/adapters/outbound_http.rs";
 
 /// Directories that must not be copied into the scratch tree. `target` would make the copy
 /// enormous and recursive; the rest are editor and VCS state the build never reads.
@@ -421,12 +424,154 @@ fn mutations(root: &Path) -> Vec<Mutation> {
         Expectation::Killed,
     ));
 
+    // --- Phase 6 JWT, JWKS, and outbound HTTP --------------------------------------------
+    all.push(mutation(
+        "jwt-format-recognition-removed",
+        JWT_AUTH,
+        "        if bearer.bytes().filter(|byte| *byte == b'.').count() != 2 {",
+        "        if bearer.bytes().filter(|byte| *byte == b'.').count() == 2 {",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "jwt-trusts-header-algorithm",
+        JWT_AUTH,
+        "        let algorithm = algorithm(cached.algorithm);",
+        "        let algorithm = header.alg;",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "jwt-nbf-validation-disabled",
+        JWT_AUTH,
+        "        validation.validate_nbf = true;",
+        "        validation.validate_nbf = false;",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "jwt-unknown-kid-becomes-outage",
+        JWT_AUTH,
+        "crate::domain::identity::JwksError::NotFound => AuthError::Rejected,",
+        "crate::domain::identity::JwksError::NotFound => AuthError::ServiceUnavailable(\"missing key\".to_owned()),",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "jwt-azp-fallback-removed",
+        JWT_AUTH,
+        "            || (!claims.aud.contains(&self.config.audience)\n                && claims.azp.as_deref() != Some(self.config.audience.as_str()))",
+        "            || !claims.aud.contains(&self.config.audience)",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "jwt-token-type-ignored",
+        JWT_AUTH,
+        "        if claims.typ != \"Bearer\"",
+        "        if false",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "jwt-no-role-becomes-write",
+        JWT_AUTH,
+        "            return Err(AuthError::Forbidden(\"NOPERM no redis role\".to_owned()));",
+        "            (false, false)",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "jwt-admin-role-ignored",
+        JWT_AUTH,
+        "        let (read_only, is_admin) = if role(\"admin\") {",
+        "        let (read_only, is_admin) = if false {",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "jwt-default-pool-changed",
+        JWT_AUTH,
+        "        let pool = claims.srh_pool.unwrap_or_else(|| \"default\".to_owned());",
+        "        let pool = claims.srh_pool.unwrap_or_else(|| \"missing\".to_owned());",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "jwt-pool-script-policy-dropped",
+        JWT_AUTH,
+        "            allowed_script_sha256: allowed_script_sha256.clone(),",
+        "            allowed_script_sha256: HashSet::new(),",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "jwt-inactive-introspection-accepted",
+        JWT_AUTH,
+        "            if !active {",
+        "            if false {",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "jwt-introspection-cache-bypassed",
+        JWT_AUTH,
+        "            let active = if let Some(active) = self.introspection_cache.get(&digest) {",
+        "            let active = if let Some(active) = None {",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "jwt-introspection-cache-bound-changed",
+        JWT_AUTH,
+        "const MAX_INTROSPECTION_ENTRIES: usize = 100_000;",
+        "const MAX_INTROSPECTION_ENTRIES: usize = 200_000;",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "jwks-signing-use-filter-reversed",
+        HTTP_JWKS,
+        "!matches!(usage, PublicKeyUse::Signature)",
+        "matches!(usage, PublicKeyUse::Signature)",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "jwks-unknown-kid-refetch-removed",
+        HTTP_JWKS,
+        "        self.refresh(true).await?;",
+        "        self.refresh(false).await?;",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "jwks-forced-refresh-throttle-removed",
+        HTTP_JWKS,
+        "            self.cache.write().await.last_forced_refresh = Some(now);\n",
+        "",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "outbound-response-limit-removed",
+        OUTBOUND_HTTP,
+        "        Limited::new(response.into_body(), max_response_bytes)",
+        "        Limited::new(response.into_body(), usize::MAX)",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "auth-forbidden-becomes-unauthorized",
+        EXTRACTORS,
+        "                AuthError::Forbidden(reason) => AppError::Forbidden(reason),",
+        "                AuthError::Forbidden(_) => AppError::Unauthorized,",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "main-omits-jwt-auth-link",
+        MAIN,
+        "Arc::new(AuthChain::new(vec![jwt_link, static_auth]))",
+        "Arc::new(AuthChain::new(vec![static_auth]))",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "main-introspection-sweep-removed",
+        MAIN,
+        "move || jwt.sweep_introspection_cache()",
+        "move || 0",
+        Expectation::Killed,
+    ));
+
     all
 }
 
 #[test]
 #[ignore = "pre-release mutation sweep: rewrites a scratch copy of the crate and runs the suite \
-            once per mutation (~3 min warm, needs no Docker). CI runs plain `cargo test`, which \
+            once per mutation (~6 min warm, needs no Docker). CI runs plain `cargo test`, which \
             skips this. Run with: cargo test --test mutation_guard -- --ignored --nocapture"]
 fn every_locked_invariant_fails_the_suite_when_it_is_broken() {
     let root = crate_root();

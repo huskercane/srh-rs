@@ -31,6 +31,7 @@ impl FromRequestParts<AppState> for AuthedIdentity {
             .await
             .map_err(|error| match error {
                 AuthError::Rejected => AppError::Unauthorized,
+                AuthError::Forbidden(reason) => AppError::Forbidden(reason),
                 AuthError::ServiceUnavailable(reason) => {
                     tracing::error!(%reason, "authentication service unavailable");
                     AppError::AuthServiceUnavailable

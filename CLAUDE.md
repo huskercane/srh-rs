@@ -212,7 +212,8 @@ body must never hold a Redis permit.
 
 ## Current implementation status
 
-Phases 0–5 are complete. All three command routes authenticate, enforce the global admission
-stack, command ACLs, and debt-aware per-credential rate limits, execute through Fred, and convert
-RESP2 results. Deferred work is marked with `TODO(phaseN)` comments where later phases attach to
-the current implementation.
+Phases 0–6 are complete. All three command routes authenticate static or Keycloak JWT
+credentials, enforce the global admission stack, command ACLs, and debt-aware per-credential
+rate limits, execute through Fred, and convert RESP2 results. JWKS discovery and optional token
+introspection use bounded Hyper/rustls adapters. Deferred work is marked with `TODO(phaseN)`
+comments where later phases attach to the current implementation.
