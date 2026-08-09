@@ -39,6 +39,22 @@ Use `rustfmt` defaults (four-space indentation) and keep `#![forbid(unsafe_code)
 
 Place focused unit tests beside their implementation and cross-module behavior in `tests/`. Give tests behavior-oriented names such as `domain_and_ports_do_not_import_adapter_dependencies`. Add contract tests when multiple implementations of a port must share semantics. Integration tests may use `testcontainers` for Redis and `wiremock` for HTTP dependencies.
 
+### Mutation sweep before a release tag
+
+A green suite is necessary, not sufficient. `tests/mutation_guard.rs` breaks one invariant at a time in a scratch copy of the crate and asserts the suite notices. It is `#[ignore]`d, so CI's `cargo test --all-features` skips it; run it by hand before tagging a release:
+
+```bash
+cargo test --test mutation_guard -- --ignored --nocapture
+```
+
+It takes about three minutes on a warm cache, needs no Docker, and never touches the working tree — the scratch copy and its build artifacts live under `target/mutation-guard/`.
+
+When you add a regression lock, add the mutation it is supposed to kill. Three rules keep the sweep honest:
+
+- A mutation whose search text no longer matches **exactly once** is a hard failure, not a pass. A silent no-op reads as "this invariant is covered" when nothing ran. Locks that repeat production data verbatim — the `HARD_DENY` literal list — need `Mutation::region` to disambiguate.
+- A mutation that fails to compile proves nothing and is rejected rather than counted as a kill.
+- Surviving mutations must be declared as `Equivalent` (behaviour-preserving) or `KnownGap` (a real, recorded hole), each with a reason. The assertion is set equality, so fixing a `KnownGap` fails the sweep until its entry is deleted — deliberately, so recorded gaps cannot rot into permanent excuses.
+
 ## Commit & Pull Request Guidelines
 
 History uses Conventional Commit subjects such as `chore: scaffold Rust project`. Continue with concise, imperative prefixes (`feat:`, `fix:`, `test:`, `docs:`, `chore:`). Keep each commit scoped to one logical change. Pull requests should summarize behavior, identify the implementation-spec phase or linked issue, call out configuration/security effects, and list verification commands. Include request/response examples for wire-protocol changes; screenshots are generally unnecessary for this API service.

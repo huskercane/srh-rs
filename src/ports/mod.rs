@@ -43,6 +43,33 @@ impl ExecutorHandle {
     pub fn executor(&self) -> &Arc<dyn CommandExecutor> {
         &self.executor
     }
+
+    /// Executes one command and releases the acquired lease before returning the result.
+    pub async fn execute_and_release(self, command: RedisCommand) -> Result<RespValue, ExecError> {
+        let result = self.executor.execute(command).await;
+        drop(self);
+        result
+    }
+
+    /// Executes a pipeline and releases the acquired lease before returning its results.
+    pub async fn pipeline_and_release(
+        self,
+        commands: Vec<RedisCommand>,
+    ) -> Vec<Result<RespValue, ExecError>> {
+        let results = self.executor.pipeline(commands).await;
+        drop(self);
+        results
+    }
+
+    /// Executes a transaction and releases the acquired lease before returning its results.
+    pub async fn transaction_and_release(
+        self,
+        commands: Vec<RedisCommand>,
+    ) -> Result<Vec<RespValue>, ExecError> {
+        let results = self.executor.transaction(commands).await;
+        drop(self);
+        results
+    }
 }
 
 /// Acquires bounded access to lazily built Redis executors.
@@ -126,6 +153,67 @@ mod tests {
         drop(handle);
 
         assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn consuming_execution_releases_each_lease_before_returning() {
+        struct ReplyingExecutor;
+
+        #[async_trait]
+        impl CommandExecutor for ReplyingExecutor {
+            async fn execute(&self, _cmd: RedisCommand) -> Result<RespValue, ExecError> {
+                Ok(RespValue::Simple("OK".to_owned()))
+            }
+
+            async fn pipeline(&self, cmds: Vec<RedisCommand>) -> Vec<Result<RespValue, ExecError>> {
+                vec![Ok(RespValue::Simple("OK".to_owned())); cmds.len()]
+            }
+
+            async fn transaction(
+                &self,
+                cmds: Vec<RedisCommand>,
+            ) -> Result<Vec<RespValue>, ExecError> {
+                Ok(vec![RespValue::Simple("OK".to_owned()); cmds.len()])
+            }
+        }
+
+        fn handle(released: &Arc<AtomicBool>) -> ExecutorHandle {
+            let executor: Arc<dyn CommandExecutor> = Arc::new(ReplyingExecutor);
+            ExecutorHandle::new(
+                executor,
+                Box::new(Lease {
+                    dropped: Arc::clone(released),
+                }),
+            )
+        }
+
+        let command = RedisCommand {
+            name: "PING".to_owned(),
+            args: Vec::new(),
+        };
+        for operation in 0..3 {
+            let released = Arc::new(AtomicBool::new(false));
+            match operation {
+                0 => {
+                    handle(&released)
+                        .execute_and_release(command.clone())
+                        .await
+                        .unwrap();
+                }
+                1 => {
+                    handle(&released)
+                        .pipeline_and_release(vec![command.clone()])
+                        .await;
+                }
+                _ => {
+                    handle(&released)
+                        .transaction_and_release(vec![command.clone()])
+                        .await
+                        .unwrap();
+                }
+            }
+            assert!(released.load(Ordering::Acquire));
+        }
     }
 
     #[test]

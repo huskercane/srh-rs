@@ -20,36 +20,50 @@ pub async fn execute(
     request: Request,
 ) -> Result<Response, AppError> {
     let body = read_body(&state, request).await?;
-    let values =
-        super::parse::command(&body, state.cfg.server.max_request_elements).map_err(|error| {
-            match error {
+    let values = match super::parse::command(&body, state.cfg.server.max_request_elements) {
+        Ok(values) => values,
+        Err(error) => {
+            // An invalid request still consumed a bounded parse. Charging the minimum cost makes
+            // repeated garbage reach the pre-parse shed instead of buying unlimited parsing.
+            charge_rate_limit(&state, &identity.0.bucket_key, 1)?;
+            return Err(match error {
                 super::parse::ParseError::RequestTooComplex => {
                     AppError::BadRequest("Request too complex".to_owned())
                 }
                 super::parse::ParseError::Invalid | super::parse::ParseError::PipelineTooLarge => {
                     AppError::BadRequest("Invalid command".to_owned())
                 }
-            }
-        })?;
+            });
+        }
+    };
+    charge_rate_limit(&state, &identity.0.bucket_key, 1)?;
+    crate::domain::acl::check(&identity.0, &values)?;
     let command = json_args_to_redis(&values)?;
-
-    // TODO(phase5): apply command ACLs before acquiring a pool.
     let handle = state
         .provider
         .acquire(&identity.0.pool)
         .await
         .map_err(|error| map_acquire_error(error, &state))?;
     let value = handle
-        .executor()
-        .execute(command)
+        .execute_and_release(command)
         .await
         .map_err(map_exec_error)?;
-    // Redis work is complete; do not hold a scarce pool permit through
-    // potentially large response conversion.
-    drop(handle);
     let mut budget = state.cfg.server.load.max_response_bytes;
     let value = redis_value_to_json(value, response_encoding(&headers), &mut budget)?;
     Ok(Json(json!({ "result": value })).into_response())
+}
+
+pub(super) fn charge_rate_limit(
+    state: &AppState,
+    bucket_key: &str,
+    command_count: usize,
+) -> Result<(), AppError> {
+    state
+        .rate_limiter
+        .charge(bucket_key, command_count)
+        .map_err(|error| AppError::RateLimited {
+            retry_after_secs: error.retry_after_secs,
+        })
 }
 
 pub(super) async fn read_body(

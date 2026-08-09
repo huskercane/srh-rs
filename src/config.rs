@@ -120,7 +120,8 @@ pub struct PoolConfig {
     pub acquire_timeout_ms: u64,
     pub max_waiters: usize,
     pub breaker: BreakerConfig,
-    /// TODO(phase5): merge this pool-level script allowlist during ACL evaluation.
+    // TODO(phase6): merge this server-controlled widening policy into every JWT identity routed
+    // to the pool, matching the static-token normalization performed in `from_new_value`.
     pub allowed_script_sha256: HashSet<String>,
 }
 
@@ -270,7 +271,6 @@ impl Config {
                 StaticTokenConfig {
                     pool: entry.pool,
                     read_only: entry.read_only,
-                    // TODO(phase5): `legacy` controls the implicit default-block set.
                     legacy: false,
                     allowed_commands: entry.allowed_commands.map(uppercase_set),
                     blocked_commands: uppercase_set(entry.blocked_commands),
@@ -284,7 +284,7 @@ impl Config {
             );
         }
 
-        let pools = raw
+        let pools: HashMap<String, PoolConfig> = raw
             .pools
             .into_iter()
             .map(|(name, pool)| {
@@ -308,6 +308,14 @@ impl Config {
                 (name, normalized)
             })
             .collect();
+
+        for token in static_tokens.values_mut() {
+            if let Some(pool) = pools.get(&token.pool) {
+                token
+                    .allowed_script_sha256
+                    .extend(pool.allowed_script_sha256.iter().cloned());
+            }
+        }
 
         Ok(Self {
             server: raw.server.into(),
@@ -945,7 +953,7 @@ mod tests {
     #[test]
     fn parses_pool_level_script_allowlist_for_phase_five() {
         let config = Config::from_json(
-            r#"{"pools":{"cache":{"connection_string":"redis://localhost:6379","allowed_script_sha256":["ABCDEF"]}}}"#,
+            r#"{"auth":{"static_tokens":{"token":{"pool":"cache","allowed_script_sha256":["1234"]}}},"pools":{"cache":{"connection_string":"redis://localhost:6379","allowed_script_sha256":["ABCDEF"]}}}"#,
         )
         .expect("pool script allowlist should parse");
         assert!(
@@ -953,6 +961,9 @@ mod tests {
                 .allowed_script_sha256
                 .contains("abcdef")
         );
+        let token = &config.auth.static_tokens[&digest_token("token")];
+        assert!(token.allowed_script_sha256.contains("1234"));
+        assert!(token.allowed_script_sha256.contains("abcdef"));
     }
 
     #[test]

@@ -3,6 +3,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
+use crate::domain::acl::AclError;
 use crate::domain::convert::ConversionError;
 
 #[derive(Debug)]
@@ -32,6 +33,15 @@ impl From<ConversionError> for AppError {
         match error {
             ConversionError::InvalidCommand => Self::BadRequest("Invalid command".to_owned()),
             ConversionError::ResponseTooLarge => Self::ResponseTooLarge,
+        }
+    }
+}
+
+impl From<AclError> for AppError {
+    fn from(error: AclError) -> Self {
+        match error {
+            AclError::InvalidCommand => Self::BadRequest("Invalid command".to_owned()),
+            AclError::Forbidden(message) => Self::Forbidden(message),
         }
     }
 }

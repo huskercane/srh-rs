@@ -13,10 +13,11 @@ Wire compatibility with the `@upstash/redis` SDK is the top-level design require
 
 > ### Status: specification-complete, implementation in progress
 >
-> Phases 0–4 are implemented: the architecture scaffold, configuration, static-token
+> Phases 0–5 are implemented: the architecture scaffold, configuration, static-token
 > authentication, admission controls, RESP conversion, and all three Redis execution routes are
-> working with lazy bounded pools, Fred-level timeouts, circuit breaking, and idle eviction.
-> Command ACLs remain permissive until Phase 5. The normative
+> working with lazy bounded pools, Fred-level timeouts, circuit breaking, idle eviction,
+> command ACL enforcement, script allowlisting, and debt-aware per-credential rate limiting.
+> The normative
 > specification is [`srh-rust-spec.md`](./srh-rust-spec.md), which defines ten phases; this
 > README documents the system that spec describes.
 >
@@ -27,14 +28,14 @@ Wire compatibility with the `@upstash/redis` SDK is the top-level design require
 > | 2 | RESP↔JSON conversion, `POST /` | Done |
 > | 3 | `POST /pipeline`, `POST /multi-exec` | Done |
 > | 4 | Lazy pools, timeouts, circuit breaker, eviction | Done |
-> | 5 | Command ACLs, rate limiting | Not started |
+> | 5 | Command ACLs, rate limiting | Done |
 > | 6 | Keycloak JWT auth, JWKS, introspection | Not started |
 > | 7 | Hardening, observability, packaging | Not started |
 > | 8 | Key-prefix isolation | Deferred — out of the first delivery |
 > | 9 | Load-handling verification | Not started |
 >
-> Treat every command, config key, and endpoint below as the target contract, not as
-> documentation of running software.
+> Sections for later phases describe the target contract; the status table identifies what is
+> currently implemented.
 
 ---
 
@@ -369,6 +370,10 @@ throughput including SDK auto-batching. Every 429 carries
 `Retry-After: ceil(|deficit| / rate)` so clients can back off deliberately instead of
 burning their retries inside a deficit they cannot see.
 
+Malformed JSON is charged the minimum one-command cost after its bounded parse. Once that
+credential spends its burst, the next request is rejected before its body is read; malformed
+traffic therefore cannot buy unlimited full-size parses without entering the throttle.
+
 ---
 
 ## Security model
@@ -413,7 +418,8 @@ blocking commands, which would pin a pool connection indefinitely (`BLPOP`, `BRP
 `FUNCTION`, which are handled by the scripting rule below.
 
 **Blocked by default, for every non-legacy identity** — every JWT identity and every
-current-format static token — unless explicitly listed in that identity's `allowed_commands`:
+current-format static token — unless explicitly listed in that identity's `allowed_commands`
+or in the server's bounded admin allowlist:
 `FLUSHALL`, `FLUSHDB`, `KEYS`, `RANDOMKEY`, `INFO`, `DBSIZE`. These are destructive or
 whole-keyspace against a possibly shared Redis. `SCAN` stays available to read-write tokens
 deliberately: it is the paginated, non-blocking iteration primitive, and blocking it pushes
@@ -430,9 +436,10 @@ subcommand, so `CONFIG GET` is allowed while `CONFIG SET` is not. An
 exemption-with-carve-outs would make every command Redis adds in future admin-allowed by
 default; an allowlist fails safe.
 
-Admin access is also a *gate, not a grant*: matching the allowlist only exempts a command from
-the hard-deny list. It still passes through the identity's own blocklist, `allowed_commands`,
-and `read_only` check.
+Admin access is also a *gate, not a grant*: matching the allowlist exempts a command from the
+hard-deny and implicit default-block sets, keeping the explicitly listed `INFO` permission live.
+It still passes through the identity's own blocklist, configured `allowed_commands`, and
+`read_only` check.
 
 Note that admin commands still have to survive Layer B. On a least-privilege pool like the
 `authkv` example, they pass Layer A and get `NOPERM` from Redis — an admin identity needs an
@@ -611,4 +618,12 @@ cargo build
 cargo test
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
+```
+
+Before tagging a release, also run the mutation sweep, which breaks one invariant at a time in a
+scratch copy of the crate and asserts that some test notices. It is `#[ignore]`d so that CI skips
+it, takes about three minutes on a warm cache, and needs no Docker:
+
+```bash
+cargo test --test mutation_guard -- --ignored --nocapture
 ```

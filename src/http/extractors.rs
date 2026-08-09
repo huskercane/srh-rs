@@ -37,6 +37,12 @@ impl FromRequestParts<AppState> for AuthedIdentity {
                 }
             })?
             .ok_or(AppError::Unauthorized)?;
+        state
+            .rate_limiter
+            .probe(&identity.bucket_key)
+            .map_err(|error| AppError::RateLimited {
+                retry_after_secs: error.retry_after_secs,
+            })?;
         Ok(Self(identity))
     }
 }

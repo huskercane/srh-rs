@@ -91,6 +91,10 @@ async fn fred_executor_satisfies_contract_and_preserves_binary_values() {
         provider,
         authenticator: Arc::new(AuthChain::new(vec![static_auth])),
         clock: Arc::new(TestClock),
+        rate_limiter: Arc::new(srh_rs::domain::rate_limit::RateLimiter::new(
+            0,
+            Arc::new(TestClock),
+        )),
         cfg: config,
     });
     let response = app

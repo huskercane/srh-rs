@@ -13,6 +13,7 @@ pub mod ports;
 pub mod testsupport;
 
 use config::Config;
+use domain::rate_limit::RateLimiter;
 use ports::{Authenticator, Clock, ExecutorProvider};
 
 /// Shared application dependencies used by every inbound HTTP handler.
@@ -21,5 +22,6 @@ pub struct AppState {
     pub provider: Arc<dyn ExecutorProvider>,
     pub authenticator: Arc<dyn Authenticator>,
     pub clock: Arc<dyn Clock>,
+    pub rate_limiter: Arc<RateLimiter>,
     pub cfg: Arc<Config>,
 }

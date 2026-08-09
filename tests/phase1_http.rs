@@ -92,6 +92,10 @@ fn app_with_auth(
         }),
         authenticator,
         clock: Arc::new(TestClock),
+        rate_limiter: Arc::new(srh_rs::domain::rate_limit::RateLimiter::new(
+            0,
+            Arc::new(TestClock),
+        )),
         cfg: config,
     })
 }

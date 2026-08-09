@@ -212,7 +212,7 @@ body must never hold a Redis permit.
 
 ## Current implementation status
 
-Phases 0–3 are complete. All three command routes authenticate, enforce the global admission
-stack, execute through Fred, and convert RESP2 results. Command ACL hooks remain permissive until
-Phase 5. Deferred work is marked with `TODO(phaseN)` comments where later phases attach to the
-current implementation.
+Phases 0–5 are complete. All three command routes authenticate, enforce the global admission
+stack, command ACLs, and debt-aware per-credential rate limits, execute through Fred, and convert
+RESP2 results. Deferred work is marked with `TODO(phaseN)` comments where later phases attach to
+the current implementation.

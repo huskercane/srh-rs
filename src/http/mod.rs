@@ -217,6 +217,10 @@ mod tests {
             provider: Arc::new(UnusedProvider),
             authenticator: Arc::new(UnusedAuthenticator),
             clock: Arc::new(TestClock),
+            rate_limiter: Arc::new(crate::domain::rate_limit::RateLimiter::new(
+                0,
+                Arc::new(TestClock),
+            )),
             cfg: Arc::clone(&config),
         };
         let api = Router::new()
@@ -269,6 +273,10 @@ mod tests {
             provider: provider.clone(),
             authenticator: Arc::new(AllowAuthenticator),
             clock: Arc::new(TestClock),
+            rate_limiter: Arc::new(crate::domain::rate_limit::RateLimiter::new(
+                0,
+                Arc::new(TestClock),
+            )),
             cfg: config,
         };
         let app = router(state);

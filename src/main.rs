@@ -13,6 +13,7 @@ use srh_rs::adapters::pool_manager::PoolManager;
 use srh_rs::adapters::static_auth::StaticAuth;
 use srh_rs::adapters::system_clock::SystemClock;
 use srh_rs::config::Config;
+use srh_rs::domain::rate_limit::RateLimiter;
 use srh_rs::ports::{Authenticator, Clock, ExecutorProvider};
 use srh_rs::{AppState, http};
 use tokio::net::TcpListener;
@@ -31,12 +32,17 @@ async fn main() -> Result<()> {
         Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
     let authenticator: Arc<dyn Authenticator> = Arc::new(AuthChain::new(vec![static_auth]));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let rate_limiter = Arc::new(RateLimiter::new(
+        config.server.rate_limit.per_token_commands_per_sec,
+        Arc::clone(&clock),
+    ));
     let pool_manager = Arc::new(PoolManager::new(Arc::clone(&config), Arc::clone(&clock)));
     let provider: Arc<dyn ExecutorProvider> = pool_manager.clone();
     let state = AppState {
         provider,
         authenticator,
         clock,
+        rate_limiter: Arc::clone(&rate_limiter),
         cfg: Arc::clone(&config),
     };
     let address = bind_address(&config.server.bind, config.server.port);
@@ -58,7 +64,9 @@ async fn main() -> Result<()> {
     let (maintenance_stop, maintenance_rx) = tokio::sync::watch::channel(false);
     let maintenance = tokio::spawn(run_pool_maintenance(
         Arc::clone(&pool_manager),
+        rate_limiter,
         maintenance_rx,
+        Duration::from_secs(60),
     ));
     loop {
         tokio::select! {
@@ -104,15 +112,22 @@ async fn main() -> Result<()> {
 
 async fn run_pool_maintenance(
     manager: Arc<PoolManager>,
+    rate_limiter: Arc<RateLimiter>,
     mut stop: tokio::sync::watch::Receiver<bool>,
+    period: Duration,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    let mut interval = tokio::time::interval(period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 manager.evict_idle().await;
-                // TODO(phase5): sweep idle rate-limit buckets in this task.
+                let limiter = Arc::clone(&rate_limiter);
+                match tokio::task::spawn_blocking(move || limiter.sweep_idle()).await {
+                    Ok(evicted) if evicted > 0 => tracing::info!(evicted, "evicted idle rate-limit buckets"),
+                    Ok(_) => {}
+                    Err(error) => tracing::error!(%error, "rate-limit maintenance failed"),
+                }
             }
             result = stop.changed() => {
                 if result.is_err() || *stop.borrow() {
@@ -173,12 +188,72 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::bind_address;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::{bind_address, run_pool_maintenance};
+    use srh_rs::adapters::pool_manager::PoolManager;
+    use srh_rs::config::Config;
+    use srh_rs::domain::rate_limit::RateLimiter;
+    use srh_rs::ports::Clock;
+
+    struct ManualClock {
+        base: Instant,
+        seconds: AtomicU64,
+    }
+
+    impl ManualClock {
+        fn advance(&self, seconds: u64) {
+            self.seconds.fetch_add(seconds, Ordering::Relaxed);
+        }
+    }
+
+    impl Clock for ManualClock {
+        fn unix_secs(&self) -> u64 {
+            0
+        }
+
+        fn instant(&self) -> Instant {
+            self.base + Duration::from_secs(self.seconds.load(Ordering::Relaxed))
+        }
+    }
 
     #[test]
     fn formats_ipv4_and_ipv6_bind_addresses() {
         assert_eq!(bind_address("127.0.0.1", 80), "127.0.0.1:80");
         assert_eq!(bind_address("::1", 80), "[::1]:80");
         assert_eq!(bind_address("::", 80), "[::]:80");
+    }
+
+    #[tokio::test]
+    async fn maintenance_loop_sweeps_idle_rate_limit_buckets() {
+        let config = Arc::new(Config::from_json("{}").expect("empty test config should parse"));
+        let clock = Arc::new(ManualClock {
+            base: Instant::now(),
+            seconds: AtomicU64::new(0),
+        });
+        let clock_port: Arc<dyn Clock> = clock.clone();
+        let manager = Arc::new(PoolManager::new(config, Arc::clone(&clock_port)));
+        let limiter = Arc::new(RateLimiter::new(1, clock_port));
+        limiter.charge("idle", 1).unwrap();
+        clock.advance(901);
+        let (stop, receiver) = tokio::sync::watch::channel(false);
+
+        let task = tokio::spawn(run_pool_maintenance(
+            manager,
+            Arc::clone(&limiter),
+            receiver,
+            Duration::from_secs(3_600),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while limiter.bucket_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the immediate maintenance tick should sweep the idle bucket");
+        stop.send(true).unwrap();
+        task.await.unwrap();
     }
 }

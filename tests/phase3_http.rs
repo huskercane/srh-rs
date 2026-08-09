@@ -124,6 +124,10 @@ fn app(
         provider: provider.clone(),
         authenticator: Arc::new(AuthChain::new(vec![static_auth])),
         clock: Arc::new(TestClock),
+        rate_limiter: Arc::new(srh_rs::domain::rate_limit::RateLimiter::new(
+            config.server.rate_limit.per_token_commands_per_sec,
+            Arc::new(TestClock),
+        )),
         cfg: config,
     });
     (router, provider)

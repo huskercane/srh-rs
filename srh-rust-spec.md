@@ -9,6 +9,9 @@ acceptance criteria; do not proceed until they pass. Do not invent features not 
 spec. Wire compatibility with the `@upstash/redis` JavaScript SDK is the top-level
 requirement — where the spec says "exactly", match exactly.
 
+**Implementation status (2026-08-08):** Phases 0–5 are complete. Phase 6 is next; Phase 8
+remains deferred as specified.
+
 **API-name caution:** dependency APIs change between versions. Type/method names in this
 spec are indicative; ALWAYS verify signatures against docs.rs for the exact version in
 Cargo.lock before writing code (fred 10 uses `fred::types::Value`, `fred::clients::Pool`,
@@ -632,8 +635,9 @@ arguments. The node beyond the element budget is rejected before materialization
 the command beyond the pipeline cap is consumed as `IgnoredAny`. Budget exhaustion
 returns 400 `{"error":"Request too complex"}`.
 
-**multi_exec.rs**: validate ALL commands (shape + ACL) before touching Redis; any
-failure → 400 with first error, nothing sent. Use fred's transaction API — and
+**multi_exec.rs**: validate ALL commands (shape + ACL) before touching Redis. An ACL
+denial → 403, while an invalid command shape → 400; either way nothing is sent. Use
+fred's transaction API — and
 **verify against the locked fred version that its transaction pins/buffers onto a
 single connection such that no other request's commands can interleave between MULTI
 and EXEC** (fred multiplexes and the Pool round-robins; the semaphore bounds
@@ -806,7 +810,10 @@ SCRIPT, FUNCTION
    allowed but `CONFIG SET/REWRITE/RESETSTAT` are not — the subcommand check is
    what makes this possible.
    **Gate, not grant (same rule as scripting below):** an ADMIN_ALLOW hit exempts
-   the command from rule 1 ONLY — it still runs rules 2–6. Otherwise an admin's
+   the command from rule 1 and counts as an explicit server-side listing only for
+   rule 4's implicit default-block set (which keeps the listed `INFO` permission live).
+   It still runs the explicit `identity.blocked_commands` check, rules 2–3, rule 5's
+   configured `allowed_commands`, and rule 6. Otherwise an admin's
    `srh_blocked_commands` claim would silently stop applying to exactly these
    commands, breaking the "claims may only narrow" invariant (Phase 6).
 
@@ -833,10 +840,10 @@ SCRIPT, FUNCTION
    respect to which KEYS it can dereference; same reasoning as EVALSHA in rule 2 —
    for now just leave a marked hook.
 
-4. `identity.blocked_commands` (includes the implicit default-block set for every
+4. `identity.blocked_commands`, followed by the implicit default-block set for every
    `!identity.legacy` identity — new-format static AND JWT — see config rules:
    FLUSHALL, FLUSHDB, KEYS, RANDOMKEY, INFO, DBSIZE — unless explicitly listed in
-   `allowed_commands`; legacy tokens exempt. SCAN remains
+   `allowed_commands` or by the server's explicit ADMIN_ALLOW set; legacy tokens exempt. SCAN remains
    available to rw tokens deliberately: it is the paginated, non-blocking iteration
    primitive, and blocking it pushes users toward worse patterns).
 
@@ -896,6 +903,9 @@ is shed at the cheapest point and cannot buy max_body_bytes of JSON parsing for
 free; (b) POST-parse: charge `max(1, n)`. Honest clients are charged accurately;
 abusive ones pay one body-parse per throttling window at most. Swept by the
 Phase 4 background task.
+If parsing fails, charge the minimum cost of one command before returning the 400;
+otherwise a credential sending only malformed JSON never becomes throttled and can
+buy an unlimited number of maximum-size parses.
 
 **Redis-side ACL (Layer B) — document in README, verify in CI job 2:** example
 provisioning for an auth-KV pool:
