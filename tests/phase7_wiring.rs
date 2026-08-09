@@ -35,4 +35,13 @@ fn release_build_matches_the_linux_production_artifact_contract() {
     let unit = source("deploy/srh-rs.service");
     assert!(unit.contains("LoadCredential=srh-config:/etc/srh-rs/tokens.json"));
     assert!(unit.contains("Environment=SRH_CONFIG_PATH=%d/srh-config"));
+    assert!(unit.contains("After=network-online.target"));
+    assert!(unit.contains("Wants=network-online.target"));
+    let directives = unit
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!directives.contains("Requires="));
+    assert!(!directives.contains("BindsTo="));
 }

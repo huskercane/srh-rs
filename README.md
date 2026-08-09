@@ -445,7 +445,8 @@ Provision it for every pool:
 
 ```
 ACL SETUSER srh-authkv on >STRONG_PASSWORD ~ww:auth:* \
-  +get +set +del +expireat +ttl +ping +command|info +multi +exec +discard
+  +get +set +del +expireat +ttl +ping +hello +info +command|info \
+  +multi +exec +discard
 ```
 
 Two traps worth knowing before you copy that:
@@ -454,9 +455,13 @@ Two traps worth knowing before you copy that:
   writes under seven separate `user:`-rooted prefixes by default. Pass `baseKeyPrefix` (for
   example `"ww:auth:"`) in the adapter options to unify them, or the pattern above locks the
   client out with `NOPERM` on every write.
-- **`+command|info` is for the proxy, not for clients.** `COMMAND` stays denied to clients,
-  but key-prefix isolation (Phase 8) runs `COMMAND INFO` over this same Redis user. Without
-  the grant, a properly provisioned pool fails at first use.
+- **`+info` and `+command|info` are for the proxy, not for clients.** The Redis client may run
+  `INFO` while bootstrapping a connection, and key-prefix isolation (Phase 8) runs
+  `COMMAND INFO` over this same Redis user. Both commands stay denied to ordinary HTTP
+  identities; without both Redis-side grants, a properly provisioned pool can fail at first use.
+- **`+hello` and `+ping` are connection lifecycle grants.** They let the Redis client negotiate
+  and check its connection. They do not expose `HELLO` or `PING` through the proxy's command
+  policy unless the HTTP identity independently has permission.
 - **`+multi +exec +discard` are also for the proxy.** Direct transaction-state commands stay
   denied to HTTP clients because they would contaminate pooled connections, but `/multi-exec`
   uses these commands internally to execute one bounded transaction.
@@ -534,6 +539,13 @@ Roles come from `resource_access[client_id].roles`, filtered by `role_prefix` (d
 | `redis:admin` | read-write, plus the admin allowlist above |
 | none | 403 `{"error":"NOPERM no redis role"}` |
 
+Create the roles on the same confidential Keycloak client named by `client_id`. The access
+token must actually contain `resource_access.<client_id>.roles`; assigning a client role to a
+service account is not sufficient by itself. Realms without Keycloak's built-in `roles` client
+scope need an explicit `oidc-usermodel-client-role-mapper` whose claim name is
+`resource_access.<client_id>.roles` and whose client-role mapping points at that client. Verify
+the emitted claim in a real client-credentials token before exposing the endpoint.
+
 Additional claims: `srh_pool` selects the pool (falling back to `default` if configured),
 `srh_blocked_commands` adds to the blocklist, and `srh_key_prefix` is reserved for Phase 8.
 
@@ -546,6 +558,11 @@ Tokens are validated for signature, exact `iss` match, `exp`/`nbf` with 30 s lee
 (`aud` contains the configured audience, or `azp` equals it, since stock Keycloak omits a
 custom `aud` unless a mapper adds one), and `typ == "Bearer"`, which rejects ID tokens and
 refresh tokens.
+
+Configure `issuer` from the public token's `iss` claim (or the public discovery document),
+byte for byte. A reverse proxy may expose Keycloak at `/realms/...` while its upstream service
+is mounted below `/auth`; in that layout the internal upstream URL is not the issuer. Using it
+causes every otherwise-valid token to fail with 401.
 
 > The `typ` check is the one validation that fails closed on an IdP *configuration* change
 > rather than a code change. If a realm or client scope overrides the token type, every
@@ -661,6 +678,9 @@ Verify before shipping to any shared host:
 - The Redis holding session or auth data runs `maxmemory-policy noeviction` with AOF
   persistence. Otherwise sessions are evicted under memory pressure — which surfaces as random
   sign-outs — or lost on restart. Check with `CONFIG GET maxmemory-policy`.
+- Linux hosts running Redis with AOF or RDB persistence set `vm.overcommit_memory=1`, preferably
+  through a dedicated file in `/etc/sysctl.d`, so background persistence is not rejected under
+  memory pressure.
 - Prefer a dedicated Redis instance for auth KV. At minimum: a dedicated DB index, a Layer B
   ACL user, and key-pattern restrictions.
 - Redis is reachable only from the proxy host, and has AUTH/ACL configured. The proxy ACL is
@@ -709,6 +729,18 @@ Restart=on-failure
 
 Keep the config file mode 0600 and root-owned. The shipped unit loads it through a systemd
 credential so the dynamic service user never needs direct access to `/etc/srh-rs`.
+
+If Redis is managed by systemd, order SRH after it with a soft dependency in a unit override:
+
+```ini
+[Unit]
+After=redis-srh.service
+Wants=redis-srh.service
+```
+
+Do not use `Requires=` or `BindsTo=` for Redis. SRH deliberately stays alive while a backend is
+down, returns fast 503 responses, and recovers when Redis comes back; a hard systemd dependency
+would stop SRH and defeat that recovery behavior.
 
 Alternatively, create a dedicated `srh-rs-config` group, add
 `SupplementaryGroups=srh-rs-config` in a unit override, and grant that group an explicit read
