@@ -1,5 +1,7 @@
 [Unit]
 Description=SRH Redis HTTP proxy
+# Keep Redis dependencies soft: use After=/Wants= in a deployment override, never
+# Requires=/BindsTo=. SRH remains available and recovers after backend restarts.
 After=network-online.target
 Wants=network-online.target
 
