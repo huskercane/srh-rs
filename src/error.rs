@@ -48,6 +48,9 @@ impl From<AclError> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        if matches!(self, Self::ResponseTooLarge) {
+            metrics::counter!("srh_shed_total", "cause" => "response_too_large").increment(1);
+        }
         let (status, message, retry_after) = match self {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_owned(), None),
             Self::Forbidden(message) => (StatusCode::FORBIDDEN, message, None),

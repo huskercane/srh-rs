@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::body::to_bytes;
-use axum::extract::{Request, State};
+use axum::extract::{Extension, Request, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
@@ -15,10 +15,12 @@ use crate::http::extractors::AuthedIdentity;
 
 pub async fn execute(
     identity: AuthedIdentity,
+    Extension(audit): Extension<crate::http::observability::AuditContext>,
     State(state): State<AppState>,
     headers: HeaderMap,
     request: Request,
 ) -> Result<Response, AppError> {
+    audit.identity(&identity.0);
     let body = read_body(&state, request).await?;
     let values = match super::parse::command(&body, state.cfg.server.max_request_elements) {
         Ok(values) => values,
@@ -36,9 +38,10 @@ pub async fn execute(
             });
         }
     };
+    audit.command(values.first().and_then(serde_json::Value::as_str), 1);
     charge_rate_limit(&state, &identity.0.bucket_key, 1)?;
     crate::domain::acl::check(&identity.0, &values)?;
-    let command = json_args_to_redis(&values)?;
+    let command = crate::domain::compat::normalize(json_args_to_redis(&values)?);
     let handle = state
         .provider
         .acquire(&identity.0.pool)
@@ -61,8 +64,11 @@ pub(super) fn charge_rate_limit(
     state
         .rate_limiter
         .charge(bucket_key, command_count)
-        .map_err(|error| AppError::RateLimited {
-            retry_after_secs: error.retry_after_secs,
+        .map_err(|error| {
+            metrics::counter!("srh_rate_limit_rejections_total").increment(1);
+            AppError::RateLimited {
+                retry_after_secs: error.retry_after_secs,
+            }
         })
 }
 

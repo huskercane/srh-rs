@@ -1,0 +1,7 @@
+pkg/commands/eval.test.ts
+pkg/commands/evalsha.test.ts
+pkg/commands/publish.test.ts
+pkg/commands/script_exists.test.ts
+pkg/commands/script_flush.test.ts
+pkg/commands/script_load.test.ts
+pkg/script.test.ts

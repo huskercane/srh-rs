@@ -20,4 +20,112 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Provision and verify the Layer B ACL user
+        env:
+          REDIS_CONTAINER: ${{ job.services.redis.id }}
+        run: |
+          docker exec "$REDIS_CONTAINER" redis-cli ACL SETUSER srh-ci reset on '>ci-password' '~ci:*' +get +set +ping
+          test "$(docker exec "$REDIS_CONTAINER" redis-cli --user srh-ci --pass ci-password SET other:key denied 2>/dev/null)" = "NOPERM this user has no permissions to access one of the keys used as arguments"
       - run: cargo test --all-features
+
+  upstash-parity:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out the pinned Deno-compatible Upstash suite
+        uses: actions/checkout@v4
+        with:
+          repository: upstash/redis-js
+          ref: 1298187065cb802720b876ff9efcf2e9d7d408ef
+          path: upstash-redis
+      - name: Build the release image
+        run: docker build --tag srh-rs:ci .
+      - name: Verify and retain the static artifact
+        run: |
+          test "$(docker image inspect srh-rs:ci --format '{{.Config.User}}')" = "nonroot:nonroot"
+          test "$(docker image inspect srh-rs:ci --format '{{.Size}}')" -lt 26214400
+          container=$(docker create srh-rs:ci)
+          docker cp "$container:/usr/local/bin/srh-rs" "$RUNNER_TEMP/srh-rs"
+          docker rm "$container"
+          docker run --rm --volume "$RUNNER_TEMP/srh-rs:/srh-rs:ro" debian:bookworm-slim \
+            sh -c 'output=$(ldd /srh-rs 2>&1 || true); echo "$output"; echo "$output" | grep -Eq "not a dynamic executable|statically linked"'
+      - name: Upload the static binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: srh-rs-x86_64-unknown-linux-musl
+          path: ${{ runner.temp }}/srh-rs
+          if-no-files-found: error
+      - name: Start Redis Stack and srh-rs
+        run: |
+          docker network create srh-parity
+          docker run --detach --name redis-stack --network srh-parity redis/redis-stack-server:6.2.6-v6
+          docker run --detach --name srh --network srh-parity \
+            --env SRH_MODE=env \
+            --env SRH_TOKEN=example_token \
+            --env SRH_CONNECTION_STRING=redis://redis-stack:6379 \
+            srh-rs:ci
+      - name: Prepare the pinned historical suite
+        run: |
+          cp ci/upstash-parity-import-map.json upstash-redis/srh-import-map.json
+          git -C upstash-redis apply ../ci/upstash-parity.patch
+          while IFS= read -r file; do
+            mv "upstash-redis/$file" "upstash-redis/$file.policy-scope"
+          done < ci/upstash-parity-policy-scope.txt
+          while IFS= read -r file; do
+            mv "upstash-redis/$file" "upstash-redis/$file.documented-skip"
+          done < ci/upstash-parity-skips.txt
+      - name: Wait for the proxy
+        run: |
+          for attempt in $(seq 1 60); do
+            if docker run --rm --network srh-parity curlimages/curl:8.14.1 --fail --silent http://srh:80/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs srh
+          exit 1
+      - name: Run the upstream Deno parity suite
+        run: |
+          docker run --rm --network srh-parity \
+            --volume "$PWD/upstash-redis:/work" \
+            --workdir /work \
+            --env UPSTASH_REDIS_REST_URL=http://srh:80 \
+            --env UPSTASH_REDIS_REST_TOKEN=example_token \
+            denoland/deno:1.37.2 test -A ./pkg
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the image by commit and report its digest
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          image="ghcr.io/${{ github.repository }}:${{ github.sha }}"
+          docker tag srh-rs:ci "$image"
+          docker push "$image"
+          docker image inspect "$image" --format '{{index .RepoDigests 0}}'

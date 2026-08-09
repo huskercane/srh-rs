@@ -212,8 +212,10 @@ body must never hold a Redis permit.
 
 ## Current implementation status
 
-Phases 0–6 are complete. All three command routes authenticate static or Keycloak JWT
+Phases 0–7 are complete. All three command routes authenticate static or Keycloak JWT
 credentials, enforce the global admission stack, command ACLs, and debt-aware per-credential
 rate limits, execute through Fred, and convert RESP2 results. JWKS discovery and optional token
-introspection use bounded Hyper/rustls adapters. Deferred work is marked with `TODO(phaseN)`
-comments where later phases attach to the current implementation.
+introspection use bounded Hyper/rustls adapters. Readiness, metrics, audit logging, static musl
+and distroless artifacts, the hardened systemd unit, and the three-job CI gate are implemented.
+Phase 8 remains deferred; Phase 9 is next. Deferred work is marked with `TODO(phaseN)` comments
+where later phases attach to the current implementation.

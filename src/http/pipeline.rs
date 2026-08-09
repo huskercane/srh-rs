@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::extract::{Request, State};
+use axum::extract::{Extension, Request, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
@@ -13,10 +13,12 @@ use crate::http::extractors::AuthedIdentity;
 
 pub async fn execute(
     identity: AuthedIdentity,
+    Extension(audit): Extension<crate::http::observability::AuditContext>,
     State(state): State<AppState>,
     headers: HeaderMap,
     request: Request,
 ) -> Result<Response, AppError> {
+    audit.identity(&identity.0);
     let body = super::command::read_body(&state, request).await?;
     let values = match super::parse::pipeline(
         &body,
@@ -39,13 +41,16 @@ pub async fn execute(
             });
         }
     };
+    audit.command(Some("PIPELINE"), values.len());
     charge_rate_limit(&state, &identity.0.bucket_key, values.len())?;
     let mut allowed_commands = Vec::new();
     let mut slots = Vec::with_capacity(values.len());
     for command in &values {
         match crate::domain::acl::check(&identity.0, command) {
             Ok(()) => {
-                allowed_commands.push(json_args_to_redis(command)?);
+                allowed_commands.push(crate::domain::compat::normalize(json_args_to_redis(
+                    command,
+                )?));
                 slots.push(None);
             }
             Err(crate::domain::acl::AclError::Forbidden(message)) => {

@@ -18,32 +18,49 @@ impl FromRequestParts<AppState> for AuthedIdentity {
             .headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            .ok_or(AppError::Unauthorized)?;
+            .ok_or_else(|| unauthorized("missing_or_malformed"))?;
         let (scheme, bearer) = authorization
             .split_once(' ')
-            .ok_or(AppError::Unauthorized)?;
+            .ok_or_else(|| unauthorized("missing_or_malformed"))?;
         if !scheme.eq_ignore_ascii_case("Bearer") || bearer.is_empty() {
-            return Err(AppError::Unauthorized);
+            return Err(unauthorized("missing_or_malformed"));
         }
         let identity = state
             .authenticator
             .authenticate(bearer)
             .await
             .map_err(|error| match error {
-                AuthError::Rejected => AppError::Unauthorized,
-                AuthError::Forbidden(reason) => AppError::Forbidden(reason),
+                AuthError::Rejected => {
+                    metrics::counter!("srh_auth_failures_total", "kind" => "rejected").increment(1);
+                    AppError::Unauthorized
+                }
+                AuthError::Forbidden(reason) => {
+                    metrics::counter!("srh_auth_failures_total", "kind" => "forbidden")
+                        .increment(1);
+                    AppError::Forbidden(reason)
+                }
                 AuthError::ServiceUnavailable(reason) => {
+                    metrics::counter!("srh_auth_failures_total", "kind" => "unavailable")
+                        .increment(1);
                     tracing::error!(%reason, "authentication service unavailable");
                     AppError::AuthServiceUnavailable
                 }
             })?
-            .ok_or(AppError::Unauthorized)?;
+            .ok_or_else(|| unauthorized("rejected"))?;
         state
             .rate_limiter
             .probe(&identity.bucket_key)
-            .map_err(|error| AppError::RateLimited {
-                retry_after_secs: error.retry_after_secs,
+            .map_err(|error| {
+                metrics::counter!("srh_rate_limit_rejections_total").increment(1);
+                AppError::RateLimited {
+                    retry_after_secs: error.retry_after_secs,
+                }
             })?;
         Ok(Self(identity))
     }
+}
+
+fn unauthorized(kind: &'static str) -> AppError {
+    metrics::counter!("srh_auth_failures_total", "kind" => kind).increment(1);
+    AppError::Unauthorized
 }

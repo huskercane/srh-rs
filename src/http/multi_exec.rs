@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::extract::{Request, State};
+use axum::extract::{Extension, Request, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
@@ -14,10 +14,12 @@ use crate::http::extractors::AuthedIdentity;
 
 pub async fn execute(
     identity: AuthedIdentity,
+    Extension(audit): Extension<crate::http::observability::AuditContext>,
     State(state): State<AppState>,
     headers: HeaderMap,
     request: Request,
 ) -> Result<Response, AppError> {
+    audit.identity(&identity.0);
     let body = super::command::read_body(&state, request).await?;
     let values = match super::parse::pipeline(
         &body,
@@ -40,6 +42,7 @@ pub async fn execute(
             });
         }
     };
+    audit.command(Some("MULTI-EXEC"), values.len());
     if values.is_empty() {
         charge_rate_limit(&state, &identity.0.bucket_key, 1)?;
         return Err(AppError::BadRequest("Invalid command".to_owned()));
@@ -50,7 +53,7 @@ pub async fn execute(
     }
     let commands = values
         .iter()
-        .map(|values| json_args_to_redis(values))
+        .map(|values| json_args_to_redis(values).map(crate::domain::compat::normalize))
         .collect::<Result<Vec<_>, _>>()?;
     let handle = state
         .provider

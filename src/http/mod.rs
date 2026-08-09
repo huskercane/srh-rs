@@ -4,6 +4,7 @@ use axum::BoxError;
 use axum::Router;
 use axum::error_handling::HandleErrorLayer;
 use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use serde_json::json;
@@ -19,6 +20,7 @@ pub mod command;
 pub mod extractors;
 pub mod health;
 pub mod multi_exec;
+pub mod observability;
 mod parse;
 pub mod pipeline;
 
@@ -34,9 +36,11 @@ pub fn router(state: AppState) -> Router {
     );
     let observability = Router::new()
         .route("/health", get(health::health))
+        .route("/ready", get(health::ready))
         .method_not_allowed_fallback(method_not_allowed);
     api.merge(observability)
         .fallback(not_found)
+        .layer(middleware::from_fn(observability::observe_request))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -48,7 +52,10 @@ fn apply_admission_controls(
     let retry_after_secs = limits.load.shed_retry_after_secs;
     api.layer(
         ServiceBuilder::new()
-            .layer(HandleErrorLayer::new(move |_error: BoxError| async move {
+            .layer(HandleErrorLayer::new(move |error: BoxError| async move {
+                if error.is::<tower::load_shed::error::Overloaded>() {
+                    metrics::counter!("srh_shed_total", "cause" => "global_limit").increment(1);
+                }
                 AppError::Overloaded { retry_after_secs }
             }))
             .load_shed()

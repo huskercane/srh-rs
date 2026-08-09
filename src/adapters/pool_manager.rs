@@ -100,6 +100,9 @@ impl PoolManager {
         // `connect` starts reconnect loops but does not wait for or ping Redis.
         let connection_task = pool.connect();
         metrics::gauge!("srh_pool_breaker_state", "pool" => name.to_owned()).set(0.0);
+        metrics::gauge!("srh_pool_active_connections", "pool" => name.to_owned()).set(0.0);
+        metrics::gauge!("srh_pool_permits_in_use", "pool" => name.to_owned()).set(0.0);
+        metrics::gauge!("srh_pool_waiter_depth", "pool" => name.to_owned()).set(0.0);
         tracing::info!(
             pool = name,
             size = pool_config.max_connections,
@@ -132,10 +135,10 @@ impl PoolManager {
         name: &str,
         entry: Arc<PoolEntry>,
     ) -> Result<ExecutorHandle, AcquireError> {
-        let admission = entry
-            .breaker
-            .admit()
-            .map_err(|retry_after_secs| AcquireError::PoolOpen { retry_after_secs })?;
+        let admission = entry.breaker.admit().map_err(|retry_after_secs| {
+            metrics::counter!("srh_shed_total", "cause" => "breaker_open").increment(1);
+            AcquireError::PoolOpen { retry_after_secs }
+        })?;
         if let Some(transition) = admission.transition {
             emit_transition(name, transition);
             if transition == crate::domain::breaker::BreakerTransition::ProbeStarted {
@@ -147,21 +150,36 @@ impl PoolManager {
             permit: Some(admission.permit),
         };
 
-        entry
+        let waiter_depth = entry
             .waiters
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |waiters| {
                 (waiters < entry.max_waiters).then_some(waiters + 1)
             })
-            .map_err(|_| AcquireError::Overloaded)?;
-        let waiter = WaiterGuard(Arc::clone(&entry.waiters));
+            .map(|previous| previous + 1)
+            .map_err(|_| {
+                metrics::counter!("srh_shed_total", "cause" => "pool_queue_full").increment(1);
+                AcquireError::Overloaded
+            })?;
+        metrics::gauge!("srh_pool_waiter_depth", "pool" => name.to_owned())
+            .set(waiter_depth as f64);
+        let waiter = WaiterGuard {
+            count: Arc::clone(&entry.waiters),
+            pool: name.to_owned(),
+        };
         let permit = tokio::time::timeout(
             entry.acquire_timeout,
             Arc::clone(&entry.permits).acquire_owned(),
         )
         .await
-        .map_err(|_| AcquireError::Overloaded)?
+        .map_err(|_| {
+            metrics::counter!("srh_shed_total", "cause" => "acquire_timeout").increment(1);
+            AcquireError::Overloaded
+        })?
         .map_err(|_| AcquireError::Internal("Redis pool semaphore closed".to_owned()))?;
         drop(waiter);
+        metrics::gauge!("srh_pool_permits_in_use", "pool" => name.to_owned()).increment(1.0);
+        metrics::gauge!("srh_pool_active_connections", "pool" => name.to_owned())
+            .set(entry.pool.active_connections().len() as f64);
 
         let executor: Arc<dyn CommandExecutor> = Arc::new(FredExecutor::from_pooled_client(
             entry.pool.next_connected().clone(),
@@ -174,7 +192,13 @@ impl PoolManager {
             name.to_owned(),
         ));
         admission_guard.permit = None;
-        Ok(ExecutorHandle::new(executor, Box::new(permit)))
+        Ok(ExecutorHandle::new(
+            executor,
+            Box::new(PoolLease {
+                _permit: permit,
+                pool: name.to_owned(),
+            }),
+        ))
     }
 
     /// Evicts fully idle pools older than the Phase 4 retention window.
@@ -191,6 +215,9 @@ impl PoolManager {
                 entry.shutdown().await;
                 evicted += 1;
                 metrics::counter!("srh_pool_evictions_total", "pool" => name.clone()).increment(1);
+                metrics::gauge!("srh_pool_active_connections", "pool" => name.clone()).set(0.0);
+                metrics::gauge!("srh_pool_permits_in_use", "pool" => name.clone()).set(0.0);
+                metrics::gauge!("srh_pool_waiter_depth", "pool" => name.clone()).set(0.0);
                 tracing::info!(pool = %name, "evicted idle Redis pool");
             }
         }
@@ -248,11 +275,27 @@ impl ExecutorProvider for PoolManager {
     }
 }
 
-struct WaiterGuard(Arc<AtomicUsize>);
+struct WaiterGuard {
+    count: Arc<AtomicUsize>,
+    pool: String,
+}
 
 impl Drop for WaiterGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.count.fetch_sub(1, Ordering::AcqRel);
+        metrics::gauge!("srh_pool_waiter_depth", "pool" => self.pool.clone())
+            .set(previous.saturating_sub(1) as f64);
+    }
+}
+
+struct PoolLease {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    pool: String,
+}
+
+impl Drop for PoolLease {
+    fn drop(&mut self) {
+        metrics::gauge!("srh_pool_permits_in_use", "pool" => self.pool.clone()).decrement(1.0);
     }
 }
 

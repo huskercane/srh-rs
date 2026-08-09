@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use axum::Extension;
+use axum::extract::ConnectInfo;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
@@ -30,6 +32,17 @@ async fn main() -> Result<()> {
         bail!("server.tls is configured, but direct TLS serving is not implemented yet");
     }
     warn_for_insecure_public_bind(&config.server.bind);
+    let metrics_address = config
+        .server
+        .metrics_bind
+        .parse::<std::net::SocketAddr>()
+        .context("validated metrics_bind stopped parsing")?;
+    metrics_exporter_prometheus::PrometheusBuilder::new()
+        .with_http_listener(metrics_address)
+        .install()
+        .context("failed to start Prometheus metrics listener")?;
+    http::observability::register_metrics(&config);
+    tracing::info!(address = %metrics_address, "metrics listener started");
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let static_auth: Arc<dyn Authenticator> =
@@ -117,7 +130,11 @@ async fn main() -> Result<()> {
                         continue;
                     }
                 };
-                let service = TowerToHyperService::new(app.clone());
+                // The direct Hyper accept loop must supply the same peer extension Axum's
+                // `into_make_service_with_connect_info` would add, or `/ready` rejects everyone.
+                let service = TowerToHyperService::new(
+                    app.clone().layer(Extension(ConnectInfo(peer)))
+                );
                 let watcher = graceful.watcher();
                 tokio::spawn(async move {
                     let mut builder = http1::Builder::new();

@@ -203,7 +203,9 @@ impl Config {
         drop(token);
 
         let mut static_tokens = HashMap::new();
-        static_tokens.insert(digest, default_token("default", false));
+        // Environment mode is the original SRH deployment interface. Keep its single token on
+        // the legacy policy so the documented Docker command retains FLUSH/KEYS compatibility.
+        static_tokens.insert(digest, default_token("default", true));
         let mut pools = HashMap::new();
         pools.insert(
             "default".to_owned(),
@@ -377,6 +379,14 @@ impl Config {
             "server.load.body_read_timeout_ms",
             self.server.load.body_read_timeout_ms,
         )?;
+        self.server
+            .metrics_bind
+            .parse::<std::net::SocketAddr>()
+            .map_err(|error| {
+                ConfigError::Validation(format!(
+                    "server.metrics_bind is not a valid socket address: {error}"
+                ))
+            })?;
 
         if let Some(jwt) = &self.auth.jwt {
             let issuer = url::Url::parse(&jwt.issuer).map_err(|error| {
@@ -1027,6 +1037,7 @@ mod tests {
                 .static_tokens
                 .contains_key(&digest_token("secret"))
         );
+        assert!(config.auth.static_tokens[&digest_token("secret")].legacy);
     }
 
     #[test]

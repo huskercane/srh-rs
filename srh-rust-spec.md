@@ -9,8 +9,8 @@ acceptance criteria; do not proceed until they pass. Do not invent features not 
 spec. Wire compatibility with the `@upstash/redis` JavaScript SDK is the top-level
 requirement — where the spec says "exactly", match exactly.
 
-**Implementation status (2026-08-08):** Phases 0–6 are complete. Phase 7 is next; Phase 8
-remains deferred as specified.
+**Implementation status (2026-08-08):** Phases 0–7 are complete. Phase 8 remains deferred as
+specified; Phase 9 is next.
 
 **API-name caution:** dependency APIs change between versions. Type/method names in this
 spec are indicative; ALWAYS verify signatures against docs.rs for the exact version in
@@ -322,6 +322,11 @@ Applies identically to all three endpoints.
   but other queued commands may already have committed. `DISCARD` applies only to
   queue-time failure before EXEC begins.
 
+The Phase 7 upstream parity gate scopes out SDK tests whose command is intentionally denied by
+the Phase 5 ACL. Those are authorization-policy cases, not wire-protocol comparisons. Protocol
+failures may be skipped only for the deliberate differences above; the two lists remain separate
+and reviewable under `ci/`.
+
 ---
 
 ## Phase 1 — Config, errors, static auth, HTTP skeleton
@@ -331,7 +336,8 @@ Applies identically to all three endpoints.
 `SRH_MODE` env (default `"file"`).
 
 **env mode**: requires `SRH_TOKEN`, `SRH_CONNECTION_STRING`; optional
-`SRH_MAX_CONNECTIONS` (default 3). Normalize to one pool `"default"` + one static token.
+`SRH_MAX_CONNECTIONS` (default 3). Normalize to one pool `"default"` + one legacy-compatible
+static token, preserving the original SRH Docker interface and command policy.
 
 **file mode**: `SRH_CONFIG_PATH` (default `./srh-config/tokens.json`). Support legacy
 AND new formats; detect legacy by top-level values containing `connection_string`.
@@ -1064,6 +1070,8 @@ IdP outage. The auth chain already supports static+JWT side by side.
 ---
 
 ## Phase 7 — Hardening, observability, packaging
+
+**Implementation status: complete (2026-08-08).**
 
 - **Audit log**: one `tracing::info!` per request: `subject`, `pool`, `command` (name
   only — NEVER args), `status`, `latency_ms`, `pipeline_len`. No bodies at info level.

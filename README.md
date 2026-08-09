@@ -13,11 +13,12 @@ Wire compatibility with the `@upstash/redis` SDK is the top-level design require
 
 > ### Status: specification-complete, implementation in progress
 >
-> Phases 0–6 are implemented: the architecture scaffold, configuration, static-token and JWT
+> Phases 0–7 are implemented: the architecture scaffold, configuration, static-token and JWT
 > authentication, admission controls, RESP conversion, and all three Redis execution routes are
 > working with lazy bounded pools, Fred-level timeouts, circuit breaking, idle eviction,
 > command ACL enforcement, script allowlisting, debt-aware per-credential rate limiting,
-> bounded JWKS discovery, and optional token introspection.
+> bounded JWKS discovery, optional token introspection, readiness and Prometheus observability,
+> and production packaging.
 > The normative
 > specification is [`srh-rust-spec.md`](./srh-rust-spec.md), which defines ten phases; this
 > README documents the system that spec describes.
@@ -31,7 +32,7 @@ Wire compatibility with the `@upstash/redis` SDK is the top-level design require
 > | 4 | Lazy pools, timeouts, circuit breaker, eviction | Done |
 > | 5 | Command ACLs, rate limiting | Done |
 > | 6 | Keycloak JWT auth, JWKS, introspection | Done |
-> | 7 | Hardening, observability, packaging | Not started |
+> | 7 | Hardening, observability, packaging | Done |
 > | 8 | Key-prefix isolation | Deferred — out of the first delivery |
 > | 9 | Load-handling verification | Not started |
 >
@@ -210,7 +211,8 @@ These are intentional and will not be "fixed":
 | `SRH_CONNECTION_STRING` | yes | — | Redis URL (`redis://` or `rediss://`) |
 | `SRH_MAX_CONNECTIONS` | no | 3 | Pool size |
 
-This normalizes to one pool named `default` and one read-write static token.
+This normalizes to one pool named `default` and one read-write, legacy-compatible static token,
+preserving the original SRH command policy for the Docker interface.
 
 ### Process-level overrides
 
@@ -543,6 +545,26 @@ One audit line per request records subject, pool, command name, status, latency,
 length. Command *arguments* are never logged, nor are tokens, JWTs, connection strings, or
 telemetry headers.
 
+### Artifacts
+
+The primary native-host artifact is a stripped static musl binary. Install the musl compiler,
+then run:
+
+```bash
+./scripts/build-artifacts.sh
+ldd target/x86_64-unknown-linux-musl/release/srh-rs
+```
+
+`ldd` must report `not a dynamic executable`. Build the non-root distroless image with:
+
+```bash
+docker build -t srh-rs:local .
+docker image inspect srh-rs:local --format '{{.Size}}'
+```
+
+CI publishes release images by digest. Deploy and promote those digests; never consume
+`:latest`.
+
 ### Behavior under load
 
 Pools are built lazily on first use, so the proxy starts healthy with Redis down and recovers
@@ -595,8 +617,19 @@ SystemCallFilter=@system-service
 Restart=on-failure
 ```
 
-Keep the config file mode 0600 and root-owned, readable via `LoadCredential` or a group ACL.
-Bind loopback and terminate TLS at the host reverse proxy.
+Keep the config file mode 0600 and root-owned. The preferred systemd path is a credential:
+
+```ini
+[Service]
+LoadCredential=srh-config:/etc/srh-rs/tokens.json
+Environment=SRH_CONFIG_PATH=%d/srh-config
+```
+
+Alternatively, create a dedicated `srh-rs-config` group, add
+`SupplementaryGroups=srh-rs-config` in a unit override, and grant that group an explicit read
+ACL with `setfacl -m g:srh-rs-config:r /etc/srh-rs/tokens.json`. Do not make the file
+world-readable. Bind loopback and terminate TLS and the per-IP rate limit at the host reverse
+proxy.
 
 On `SIGTERM`/`SIGINT` the proxy stops accepting connections, drains in-flight requests with a
 15-second deadline, closes its pools, and exits. In-flight work finishes; new work is refused
@@ -628,8 +661,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 Before tagging a release, also run the mutation sweep, which breaks one invariant at a time in a
 scratch copy of the crate and asserts that some test notices. It is `#[ignore]`d so that CI skips
-it, takes about six minutes on a warm cache, and needs no Docker:
+it, takes about eight minutes on a warm cache, and needs no Docker:
 
 ```bash
 cargo test --test mutation_guard -- --ignored --nocapture
 ```
+
+CI also runs the pinned, last Deno-compatible upstream Upstash suite at commit
+`1298187065cb802720b876ff9efcf2e9d7d408ef` against Redis Stack and the built image. The current
+upstream suite uses Bun, so moving that pin requires explicitly migrating the gate. Files under
+`ci/upstash-parity-policy-scope.txt` exercise commands the Phase 5 ACL intentionally denies and
+are outside protocol comparison; `ci/upstash-parity-skips.txt` contains only §1.7 protocol
+differences. The historical suite's dead `denopkg.com` import is remapped to the same tagged
+source on GitHub by the checked-in import map.

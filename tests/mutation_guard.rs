@@ -15,7 +15,7 @@
 //!
 //! The sweep never touches the working tree. It copies the crate (minus `target/` and VCS
 //! directories) into `target/mutation-guard/tree`, applies one mutation at a time there, and runs
-//! that copy's `cargo test` with its own `CARGO_TARGET_DIR`. Expect about six minutes once
+//! that copy's `cargo test` with its own `CARGO_TARGET_DIR`. Expect about eight minutes once
 //! the scratch target directory is warm, and a few more on the first run.
 //!
 //! ## Adding a mutation
@@ -54,6 +54,10 @@ const PORTS: &str = "src/ports/mod.rs";
 const JWT_AUTH: &str = "src/adapters/jwt_auth.rs";
 const HTTP_JWKS: &str = "src/adapters/http_jwks.rs";
 const OUTBOUND_HTTP: &str = "src/adapters/outbound_http.rs";
+const CONFIG: &str = "src/config.rs";
+const COMPAT: &str = "src/domain/compat.rs";
+const HEALTH: &str = "src/http/health.rs";
+const OBSERVABILITY: &str = "src/http/observability.rs";
 
 /// Directories that must not be copied into the scratch tree. `target` would make the copy
 /// enormous and recursive; the rest are editor and VCS state the build never reads.
@@ -302,15 +306,15 @@ fn mutations(root: &Path) -> Vec<Mutation> {
     all.push(mutation(
         "probe-removed",
         EXTRACTORS,
-        "        state\n            .rate_limiter\n            .probe(&identity.bucket_key)\n            .map_err(|error| AppError::RateLimited {\n                retry_after_secs: error.retry_after_secs,\n            })?;\n",
+        "        state\n            .rate_limiter\n            .probe(&identity.bucket_key)\n            .map_err(|error| {\n                metrics::counter!(\"srh_rate_limit_rejections_total\").increment(1);\n                AppError::RateLimited {\n                    retry_after_secs: error.retry_after_secs,\n                }\n            })?;\n",
         "",
         Expectation::Killed,
     ));
     all.push(mutation(
         "single-acl-after-acquire",
         COMMAND,
-        "    crate::domain::acl::check(&identity.0, &values)?;\n    let command = json_args_to_redis(&values)?;\n    let handle = state\n        .provider\n        .acquire(&identity.0.pool)\n        .await\n        .map_err(|error| map_acquire_error(error, &state))?;",
-        "    let command = json_args_to_redis(&values)?;\n    let handle = state\n        .provider\n        .acquire(&identity.0.pool)\n        .await\n        .map_err(|error| map_acquire_error(error, &state))?;\n    crate::domain::acl::check(&identity.0, &values)?;",
+        "    crate::domain::acl::check(&identity.0, &values)?;\n    let command = crate::domain::compat::normalize(json_args_to_redis(&values)?);\n    let handle = state\n        .provider\n        .acquire(&identity.0.pool)\n        .await\n        .map_err(|error| map_acquire_error(error, &state))?;",
+        "    let command = crate::domain::compat::normalize(json_args_to_redis(&values)?);\n    let handle = state\n        .provider\n        .acquire(&identity.0.pool)\n        .await\n        .map_err(|error| map_acquire_error(error, &state))?;\n    crate::domain::acl::check(&identity.0, &values)?;",
         Expectation::Killed,
     ));
     all.push(mutation(
@@ -339,8 +343,8 @@ fn mutations(root: &Path) -> Vec<Mutation> {
     all.push(mutation(
         "single-charge-removed",
         COMMAND,
-        "    };\n    charge_rate_limit(&state, &identity.0.bucket_key, 1)?;\n    crate::domain::acl::check",
-        "    };\n    crate::domain::acl::check",
+        "    audit.command(values.first().and_then(serde_json::Value::as_str), 1);\n    charge_rate_limit(&state, &identity.0.bucket_key, 1)?;\n    crate::domain::acl::check",
+        "    audit.command(values.first().and_then(serde_json::Value::as_str), 1);\n    crate::domain::acl::check",
         Expectation::Killed,
     ));
     all.push(mutation(
@@ -547,8 +551,8 @@ fn mutations(root: &Path) -> Vec<Mutation> {
     all.push(mutation(
         "auth-forbidden-becomes-unauthorized",
         EXTRACTORS,
-        "                AuthError::Forbidden(reason) => AppError::Forbidden(reason),",
-        "                AuthError::Forbidden(_) => AppError::Unauthorized,",
+        "                AuthError::Forbidden(reason) => {\n                    metrics::counter!(\"srh_auth_failures_total\", \"kind\" => \"forbidden\")\n                        .increment(1);\n                    AppError::Forbidden(reason)\n                }",
+        "                AuthError::Forbidden(_) => {\n                    metrics::counter!(\"srh_auth_failures_total\", \"kind\" => \"forbidden\")\n                        .increment(1);\n                    AppError::Unauthorized\n                }",
         Expectation::Killed,
     ));
     all.push(mutation(
@@ -566,12 +570,70 @@ fn mutations(root: &Path) -> Vec<Mutation> {
         Expectation::Killed,
     ));
 
+    // --- Phase 7 observability, readiness, and parity compatibility ---------------------
+    all.push(mutation(
+        "env-mode-loses-legacy-policy",
+        CONFIG,
+        "static_tokens.insert(digest, default_token(\"default\", true));",
+        "static_tokens.insert(digest, default_token(\"default\", false));",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "geodist-unit-normalization-removed",
+        COMPAT,
+        "    if command.name == \"GEODIST\"\n        && let Some(unit) = command.args.last_mut()",
+        "    if false\n        && let Some(unit) = command.args.last_mut()",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "readiness-loopback-gate-removed",
+        HEALTH,
+        "    if !peer.ip().is_loopback() {",
+        "    if false {",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "readiness-skips-real-provider-check",
+        HEALTH,
+        "        .readiness()\n        .await",
+        "        .readiness()\n        .await.into_iter().take(0).collect::<Vec<_>>()",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "audit-subject-omitted",
+        OBSERVABILITY,
+        "        subject = fields.subject.as_deref().unwrap_or(\"-\"),",
+        "        subject = \"-\",",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "endpoint-label-cardinality-unbounded",
+        OBSERVABILITY,
+        "        _ => \"other\",",
+        "        _ => \"/\",",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "http-request-metric-unregistered",
+        OBSERVABILITY,
+        "metrics::counter!(\"srh_http_requests_total\", \"endpoint\" => \"-\", \"status\" => \"-\")",
+        "metrics::counter!(\"srh_http_requests_total_broken\", \"endpoint\" => \"-\", \"status\" => \"-\")",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "main-omits-peer-connect-info",
+        MAIN,
+        "app.clone().layer(Extension(ConnectInfo(peer)))",
+        "app.clone()",
+        Expectation::Killed,
+    ));
+
     all
 }
 
 #[test]
 #[ignore = "pre-release mutation sweep: rewrites a scratch copy of the crate and runs the suite \
-            once per mutation (~6 min warm, needs no Docker). CI runs plain `cargo test`, which \
+            once per mutation (~8 min warm, needs no Docker). CI runs plain `cargo test`, which \
             skips this. Run with: cargo test --test mutation_guard -- --ignored --nocapture"]
 fn every_locked_invariant_fails_the_suite_when_it_is_broken() {
     let root = crate_root();
