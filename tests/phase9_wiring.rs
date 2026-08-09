@@ -6,7 +6,7 @@ fn source(path: &str) -> String {
 }
 
 #[test]
-fn runtime_and_nightly_gate_keep_phase_nine_protections_wired() {
+fn runtime_and_scheduled_gates_keep_protections_wired() {
     let main = source("src/main.rs");
     assert!(main.contains("stream.set_nodelay(true)"));
 
@@ -16,6 +16,20 @@ fn runtime_and_nightly_gate_keep_phase_nine_protections_wired() {
     let workflow = source(".github/workflows/load.yml");
     assert!(workflow.contains("schedule:"));
     assert!(workflow.contains("./scripts/phase9-load.sh"));
+
+    let mutation_workflow = source(".github/workflows/mutation.yml");
+    assert!(mutation_workflow.contains("schedule:"));
+    assert!(
+        mutation_workflow.contains("cargo test --test mutation_guard -- --ignored --nocapture")
+    );
+
+    for document in [source("README.md"), source("srh-rust-spec.md")] {
+        assert!(document.contains("+command|info +multi +exec +discard"));
+    }
+    let ci = source(".github/workflows/ci.yml");
+    assert!(ci.contains("+ping +multi +exec +discard"));
+    assert!(ci.contains("parity policy-scope skip:"));
+    assert!(ci.contains("parity documented protocol skip:"));
 
     let shell = source("scripts/phase9-load.sh");
     for profile in ["overload", "backend-death", "slow-client"] {

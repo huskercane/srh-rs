@@ -44,7 +44,7 @@ jobs:
         env:
           REDIS_CONTAINER: ${{ job.services.redis.id }}
         run: |
-          docker exec "$REDIS_CONTAINER" redis-cli ACL SETUSER srh-ci reset on '>ci-password' '~ci:*' +get +set +ping
+          docker exec "$REDIS_CONTAINER" redis-cli ACL SETUSER srh-ci reset on '>ci-password' '~ci:*' +get +set +ping +multi +exec +discard
           test "$(docker exec --env REDISCLI_AUTH=ci-password "$REDIS_CONTAINER" redis-cli --user srh-ci SET ci:allowed accepted)" = "OK"
           denied=$(docker exec --env REDISCLI_AUTH=ci-password "$REDIS_CONTAINER" redis-cli --user srh-ci SET other:key denied)
           case "$denied" in
@@ -97,9 +97,11 @@ jobs:
           cp ci/upstash-parity-import-map.json upstash-redis/srh-import-map.json
           git -C upstash-redis apply ../ci/upstash-parity.patch
           while IFS= read -r file; do
+            echo "parity policy-scope skip: $file"
             mv "upstash-redis/$file" "upstash-redis/$file.policy-scope"
           done < ci/upstash-parity-policy-scope.txt
           while IFS= read -r file; do
+            echo "parity documented protocol skip: $file"
             mv "upstash-redis/$file" "upstash-redis/$file.documented-skip"
           done < ci/upstash-parity-skips.txt
       - name: Wait for the proxy

@@ -5,6 +5,7 @@ use crate::ports::RedisCommand;
 /// Applies the small argument normalizations required by the Upstash wire contract.
 pub fn normalize(mut command: RedisCommand) -> RedisCommand {
     if command.name == "GEODIST"
+        && command.args.len() == 4
         && let Some(unit) = command.args.last_mut()
         && matches!(unit.as_ref(), b"M" | b"KM" | b"FT" | b"MI")
     {

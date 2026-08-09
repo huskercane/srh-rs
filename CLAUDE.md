@@ -13,7 +13,7 @@ limiting, circuit breaking).
 requirement.** Where the spec says "exactly", match exactly — including the deliberate
 divergences in §1.7 that must NOT be "fixed".
 
-It is its own git repository (currently with no remote), sitting under `~/work/whiskerwatch/`
+It is its own git repository, sitting under `~/work/whiskerwatch/`
 because WhiskerWatch's NextAuth `@auth/upstash-redis-adapter` is the first consumer,
 talking to the auth-session Redis under a single `ww:auth:` key root. The parent
 `~/work/whiskerwatch/CLAUDE.md` will also load; its per-service rules (api/ml-service/

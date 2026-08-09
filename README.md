@@ -393,7 +393,7 @@ Provision it for every pool:
 
 ```
 ACL SETUSER srh-authkv on >STRONG_PASSWORD ~ww:auth:* \
-  +get +set +del +expireat +ttl +ping +command|info
+  +get +set +del +expireat +ttl +ping +command|info +multi +exec +discard
 ```
 
 Two traps worth knowing before you copy that:
@@ -405,6 +405,9 @@ Two traps worth knowing before you copy that:
 - **`+command|info` is for the proxy, not for clients.** `COMMAND` stays denied to clients,
   but key-prefix isolation (Phase 8) runs `COMMAND INFO` over this same Redis user. Without
   the grant, a properly provisioned pool fails at first use.
+- **`+multi +exec +discard` are also for the proxy.** Direct transaction-state commands stay
+  denied to HTTP clients because they would contaminate pooled connections, but `/multi-exec`
+  uses these commands internally to execute one bounded transaction.
 
 ### Command policy
 
@@ -415,7 +418,8 @@ Inside a pipeline the request is still 200 and that string appears in the failin
 `SHUTDOWN`, `DEBUG`, `SLAVEOF`/`REPLICAOF`, `MIGRATE`, `MODULE`, `SAVE`, `BGSAVE`,
 `BGREWRITEAOF`, `LASTSAVE`, `ACL`, `CLIENT`, `CLUSTER`, `LATENCY`, `MONITOR`, `PSYNC`, `SYNC`,
 `FAILOVER`, `RESET`, `SLOWLOG`, `COMMAND`, `MEMORY`); connection state that would corrupt a
-pooled connection for its next user (`HELLO`, `SELECT`, `SWAPDB`, `AUTH`, `QUIT`); pub/sub;
+pooled connection for its next user (`HELLO`, `SELECT`, `SWAPDB`, `AUTH`, `QUIT`, `MULTI`,
+`EXEC`, `DISCARD`, `WATCH`, `UNWATCH`); pub/sub;
 blocking commands, which would pin a pool connection indefinitely (`BLPOP`, `BRPOP`, `BLMOVE`,
 `BRPOPLPUSH`, `BLMPOP`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`, `WAIT`, `WAITAOF`); and `SCRIPT` /
 `FUNCTION`, which are handled by the scripting rule below.
@@ -514,7 +518,10 @@ revocation over availability. Results are cached by the token's SHA-256 digest i
 high-entropy static `sha256:` token, tightly scoped to its own pool and `allowed_commands`,
 stored offline. The auth chain accepts static and JWT credentials side by side, so this keeps
 operators in during an IdP outage. The escape hatch is a break-glass token, never fail-open
-authentication.
+authentication. Static credentials may contain dots: dotted text whose first segment is not a
+JSON JWT header falls through to static authentication. Once a bearer has a base64url JSON JWT
+header, every validation failure is definitive and can never fall through to a same-value static
+credential.
 
 ---
 
@@ -673,12 +680,18 @@ cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 Before tagging a release, also run the mutation sweep, which breaks one invariant at a time in a
-scratch copy of the crate and asserts that some test notices. It is `#[ignore]`d so that CI skips
-it, takes about seventeen minutes on a warm cache, and needs no Docker:
+scratch copy of the crate and asserts that some test notices. It is `#[ignore]`d in ordinary test
+runs, runs weekly in the scheduled mutation workflow, takes about fifteen minutes on a warm
+cache, and needs no Docker:
 
 ```bash
 cargo test --test mutation_guard -- --ignored --nocapture
 ```
+
+The sweep deliberately runs default features so each mutation stays Docker-free. Redis Layer B
+behavior is covered by the all-features integration job, but not by the per-mutation runs.
+Mutation kills include both behavioral tests and a small set of explicit source-wiring assertions
+for the composition root and workflow files; those wiring kills are not behavioral coverage.
 
 CI also runs the pinned, last Deno-compatible upstream Upstash suite at commit
 `1298187065cb802720b876ff9efcf2e9d7d408ef` against Redis Stack and the built image. The current

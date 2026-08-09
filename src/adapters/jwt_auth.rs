@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use base64::Engine;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -300,8 +301,27 @@ impl Authenticator for JwtAuth {
         if bearer.bytes().filter(|byte| *byte == b'.').count() != 2 {
             return Ok(None);
         }
+        if decode_header(bearer).is_err() {
+            return if has_json_header(bearer) {
+                Err(AuthError::Rejected)
+            } else {
+                Ok(None)
+            };
+        }
         self.validate(bearer).await.map(Some)
     }
+}
+
+fn has_json_header(bearer: &str) -> bool {
+    bearer
+        .split_once('.')
+        .and_then(|(header, _)| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(header)
+                .ok()
+        })
+        .and_then(|header| serde_json::from_slice::<serde_json::Value>(&header).ok())
+        .is_some_and(|header| header.is_object())
 }
 
 fn algorithm(value: JwtAlgorithm) -> Algorithm {

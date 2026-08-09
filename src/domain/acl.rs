@@ -35,6 +35,13 @@ const HARD_DENY: &[&str] = &[
     "SWAPDB",
     "AUTH",
     "QUIT",
+    // Redis transactions and WATCH state outlive one HTTP request on a pooled connection.
+    // Allowing them lets one caller queue later callers' commands and receive their results.
+    "MULTI",
+    "EXEC",
+    "DISCARD",
+    "WATCH",
+    "UNWATCH",
     "SUBSCRIBE",
     "PSUBSCRIBE",
     "UNSUBSCRIBE",
@@ -361,6 +368,11 @@ mod tests {
             "SWAPDB",
             "AUTH",
             "QUIT",
+            "MULTI",
+            "EXEC",
+            "DISCARD",
+            "WATCH",
+            "UNWATCH",
             "SUBSCRIBE",
             "PSUBSCRIBE",
             "UNSUBSCRIBE",
@@ -386,6 +398,18 @@ mod tests {
         }
         assert_denied(&identity, json!(["CONFIG", "GET", "maxmemory"]));
         assert_denied(&identity, json!(["MEMORY", "USAGE", "key"]));
+    }
+
+    #[test]
+    fn transaction_state_commands_cannot_escape_onto_a_pooled_connection() {
+        let ordinary = identity();
+        let mut admin = identity();
+        admin.is_admin = true;
+        for identity in [&ordinary, &admin] {
+            for name in ["MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH"] {
+                assert_denied(identity, json!([name]));
+            }
+        }
     }
 
     #[test]

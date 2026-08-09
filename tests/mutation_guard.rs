@@ -60,6 +60,7 @@ const HEALTH: &str = "src/http/health.rs";
 const OBSERVABILITY: &str = "src/http/observability.rs";
 const HTTP_MOD: &str = "src/http/mod.rs";
 const LOAD_WORKFLOW: &str = ".github/workflows/load.yml";
+const MUTATION_WORKFLOW: &str = ".github/workflows/mutation.yml";
 
 /// Directories that must not be copied into the scratch tree. `target` would make the copy
 /// enormous and recursive; the rest are editor and VCS state the build never reads.
@@ -434,8 +435,22 @@ fn mutations(root: &Path) -> Vec<Mutation> {
     all.push(mutation(
         "jwt-format-recognition-removed",
         JWT_AUTH,
-        "        if bearer.bytes().filter(|byte| *byte == b'.').count() != 2 {",
-        "        if bearer.bytes().filter(|byte| *byte == b'.').count() == 2 {",
+        "        if bearer.bytes().filter(|byte| *byte == b'.').count() != 2",
+        "        if bearer.bytes().filter(|byte| *byte == b'.').count() == 2",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "jwt-malformed-header-claimed",
+        JWT_AUTH,
+        "            return if has_json_header(bearer) {",
+        "            return if true {",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "jwt-json-header-falls-through",
+        JWT_AUTH,
+        "            return if has_json_header(bearer) {",
+        "            return if false {",
         Expectation::Killed,
     ));
     all.push(mutation(
@@ -583,8 +598,15 @@ fn mutations(root: &Path) -> Vec<Mutation> {
     all.push(mutation(
         "geodist-unit-normalization-removed",
         COMPAT,
-        "    if command.name == \"GEODIST\"\n        && let Some(unit) = command.args.last_mut()",
-        "    if false\n        && let Some(unit) = command.args.last_mut()",
+        "    if command.name == \"GEODIST\"\n        && command.args.len() == 4\n        && let Some(unit) = command.args.last_mut()",
+        "    if false\n        && command.args.len() == 4\n        && let Some(unit) = command.args.last_mut()",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "geodist-arity-guard-removed",
+        COMPAT,
+        "        && command.args.len() == 4",
+        "        && true",
         Expectation::Killed,
     ));
     all.push(mutation(
@@ -673,14 +695,22 @@ fn mutations(root: &Path) -> Vec<Mutation> {
         "  schedule_broken:\n    - cron: \"17 5 * * *\"",
         Expectation::Killed,
     ));
+    all.push(mutation(
+        "scheduled-mutation-sweep-removed",
+        MUTATION_WORKFLOW,
+        "        run: cargo test --test mutation_guard -- --ignored --nocapture",
+        "        run: cargo test --test mutation_guard",
+        Expectation::Killed,
+    ));
 
     all
 }
 
 #[test]
 #[ignore = "pre-release mutation sweep: rewrites a scratch copy of the crate and runs the suite \
-            once per mutation (~17 min warm, needs no Docker). CI runs plain `cargo test`, which \
-            skips this. Run with: cargo test --test mutation_guard -- --ignored --nocapture"]
+            once per mutation (~15 min warm, needs no Docker). Ordinary CI runs plain `cargo \
+            test`, which skips this; a scheduled workflow runs it weekly. Run with: cargo test \
+            --test mutation_guard -- --ignored --nocapture"]
 fn every_locked_invariant_fails_the_suite_when_it_is_broken() {
     let root = crate_root();
     let scratch = root.join("target/mutation-guard/tree");

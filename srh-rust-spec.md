@@ -790,7 +790,7 @@ CONFIG, SHUTDOWN, DEBUG, SLAVEOF, REPLICAOF, MIGRATE, MODULE, SAVE, BGSAVE,
 BGREWRITEAOF, LASTSAVE, ACL, CLIENT, CLUSTER, LATENCY, MONITOR, PSYNC, SYNC,
 FAILOVER, RESET, SLOWLOG, COMMAND, MEMORY,
 # protocol/session state on pooled connections — correctness, not just security
-HELLO, SELECT, SWAPDB, AUTH, QUIT,
+HELLO, SELECT, SWAPDB, AUTH, QUIT, MULTI, EXEC, DISCARD, WATCH, UNWATCH,
 # pub/sub
 SUBSCRIBE, PSUBSCRIBE, UNSUBSCRIBE, PUNSUBSCRIBE, SSUBSCRIBE, SUNSUBSCRIBE, PUBLISH, PUBSUB,
 # blocking — would pin pool connections
@@ -800,7 +800,9 @@ SCRIPT, FUNCTION
 ```
    Rationale comments required in code: HELLO switches RESP version on a pooled
    connection and corrupts it for all subsequent users; SELECT/SWAPDB escape DB-index
-   isolation; blocking commands pin pool connections indefinitely.
+   isolation; MULTI/WATCH transaction state survives the HTTP request and can queue other
+   callers' commands or expose their results; blocking commands pin pool connections
+   indefinitely.
    **HARD_DENY has no escape hatch; `is_admin` identities get a bounded, explicit
    allowlist evaluated first.** The **ADMIN_ALLOW** set, checked subcommand-aware
    (argv[0]+argv[1]) BEFORE rule 1:
@@ -916,7 +918,7 @@ buy an unlimited number of maximum-size parses.
 **Redis-side ACL (Layer B) — document in README, verify in CI job 2:** example
 provisioning for an auth-KV pool:
 ```
-ACL SETUSER srh-authkv on >STRONG_PASSWORD ~ww:auth:* +get +set +del +expireat +ttl +ping +command|info
+ACL SETUSER srh-authkv on >STRONG_PASSWORD ~ww:auth:* +get +set +del +expireat +ttl +ping +command|info +multi +exec +discard
 ```
 Two traps to document alongside it:
 - **Key patterns must match the client's ACTUAL key roots.** The
@@ -928,6 +930,9 @@ Two traps to document alongside it:
 - **`+command|info` is for the PROXY, not clients.** COMMAND stays in HARD_DENY for
   clients, but Phase 8 runs `COMMAND INFO` at pool build over this same Layer B
   user; without the grant, every properly-provisioned Phase 8 pool fails at startup.
+- **`+multi +exec +discard` are for the PROXY, not clients.** Direct transaction-state
+  commands stay in HARD_DENY because they contaminate pooled connections; `/multi-exec`
+  needs these grants for its internal bounded transaction.
 CI job 2 runs the integration suite against a Redis provisioned with a restricted ACL
 user and asserts that an EVAL smuggled past a hypothetically-broken Layer A still fails
 at Redis with a NOPERM error.
@@ -1051,7 +1056,10 @@ static token, below, not fail-open).
 **Break-glass pattern (README, not code):** deployments using JWT for primary access
 SHOULD configure one high-entropy static `sha256:` token, tightly scoped
 (allowed_commands, own pool), stored offline, so operators retain KV access during an
-IdP outage. The auth chain already supports static+JWT side by side.
+IdP outage. The auth chain already supports static+JWT side by side. Dotted plaintext
+credentials whose first segment is not a JSON JWT header must remain eligible for static
+authentication; once a base64url JSON JWT header is present, all failures are definitive and
+must not fall through to a same-value static credential.
 
 ### Phase 6 acceptance (wiremock JWKS + locally minted tokens; no live Keycloak)
 - Valid RS256 + redis:write → SET 200.
