@@ -50,7 +50,7 @@ pub async fn execute(
     let value = handle
         .execute_and_release(command)
         .await
-        .map_err(map_exec_error)?;
+        .map_err(|error| map_exec_error(error, &state))?;
     let mut budget = state.cfg.server.load.max_response_bytes;
     let value = redis_value_to_json(value, response_encoding(&headers), &mut budget)?;
     Ok(Json(json!({ "result": value })).into_response())
@@ -61,7 +61,7 @@ pub(super) fn charge_rate_limit(
     bucket_key: &str,
     command_count: usize,
 ) -> Result<(), AppError> {
-    state
+    let result = state
         .rate_limiter
         .charge(bucket_key, command_count)
         .map_err(|error| {
@@ -69,7 +69,17 @@ pub(super) fn charge_rate_limit(
             AppError::RateLimited {
                 retry_after_secs: error.retry_after_secs,
             }
-        })
+        });
+    record_debt_forgiveness(state);
+    result
+}
+
+pub(super) fn record_debt_forgiveness(state: &AppState) {
+    let count = state.rate_limiter.take_debt_forgiven_evictions();
+    if count > 0 {
+        metrics::counter!("srh_shed_total", "cause" => "debt_forgiven_by_eviction")
+            .increment(count);
+    }
 }
 
 pub(super) async fn read_body(
@@ -93,12 +103,18 @@ pub(super) fn response_encoding(headers: &HeaderMap) -> Encoding {
         .map_or(Encoding::None, |_| Encoding::Base64)
 }
 
-pub(super) fn map_exec_error(error: ExecError) -> AppError {
+pub(super) fn map_exec_error(error: ExecError, state: &AppState) -> AppError {
     match error {
         ExecError::Redis(message) => AppError::RedisError(message),
         ExecError::ResponseTooLarge => AppError::ResponseTooLarge,
-        ExecError::Timeout => AppError::Internal("Redis command timed out".to_owned()),
-        ExecError::Transport(message) => AppError::Internal(message),
+        ExecError::Timeout => AppError::PoolOpen {
+            retry_after_secs: state.cfg.server.load.shed_retry_after_secs,
+            reason: "Redis command timed out".to_owned(),
+        },
+        ExecError::Transport(reason) => AppError::PoolOpen {
+            retry_after_secs: state.cfg.server.load.shed_retry_after_secs,
+            reason,
+        },
     }
 }
 

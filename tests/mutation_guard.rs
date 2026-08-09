@@ -58,6 +58,8 @@ const CONFIG: &str = "src/config.rs";
 const COMPAT: &str = "src/domain/compat.rs";
 const HEALTH: &str = "src/http/health.rs";
 const OBSERVABILITY: &str = "src/http/observability.rs";
+const HTTP_MOD: &str = "src/http/mod.rs";
+const LOAD_WORKFLOW: &str = ".github/workflows/load.yml";
 
 /// Directories that must not be copied into the scratch tree. `target` would make the copy
 /// enormous and recursive; the rest are editor and VCS state the build never reads.
@@ -276,15 +278,15 @@ fn mutations(root: &Path) -> Vec<Mutation> {
     all.push(mutation(
         "rate-bound-removed",
         RATE_LIMIT,
-        "        if buckets.entries.len() >= self.max_buckets {\n            evict_one(buckets);\n        }\n",
+        "        if buckets.entries.len() >= self.max_buckets && evict_one(buckets) {\n            self.debt_forgiven_evictions.fetch_add(1, Ordering::Relaxed);\n        }\n",
         "",
         Expectation::Killed,
     ));
     all.push(mutation(
         "evict-prefers-debt",
         RATE_LIMIT,
-        "    let candidate = buckets.credit_lru.pop_first().or_else(|| {",
-        "    let candidate = buckets.debt_lru.pop_first().or_else(|| {",
+        "if let Some(candidate) = buckets.credit_lru.pop_first()",
+        "if let Some(candidate) = buckets.debt_lru.pop_first()",
         Expectation::Killed,
     ));
     all.push(mutation(
@@ -306,7 +308,7 @@ fn mutations(root: &Path) -> Vec<Mutation> {
     all.push(mutation(
         "probe-removed",
         EXTRACTORS,
-        "        state\n            .rate_limiter\n            .probe(&identity.bucket_key)\n            .map_err(|error| {\n                metrics::counter!(\"srh_rate_limit_rejections_total\").increment(1);\n                AppError::RateLimited {\n                    retry_after_secs: error.retry_after_secs,\n                }\n            })?;\n",
+        "        let probe = state\n            .rate_limiter\n            .probe(&identity.bucket_key)\n            .map_err(|error| {\n                metrics::counter!(\"srh_rate_limit_rejections_total\").increment(1);\n                AppError::RateLimited {\n                    retry_after_secs: error.retry_after_secs,\n                }\n            });\n        super::command::record_debt_forgiveness(state);\n        probe?;\n",
         "",
         Expectation::Killed,
     ));
@@ -628,12 +630,56 @@ fn mutations(root: &Path) -> Vec<Mutation> {
         Expectation::Killed,
     ));
 
+    // --- Phase 9 bend-not-break verification ------------------------------------------
+    all.push(mutation(
+        "rate-debt-forgiveness-unreported",
+        RATE_LIMIT,
+        "self.debt_forgiven_evictions.fetch_add(1, Ordering::Relaxed);",
+        "self.debt_forgiven_evictions.fetch_add(0, Ordering::Relaxed);",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "backend-timeout-becomes-500",
+        COMMAND,
+        "        ExecError::Timeout => AppError::PoolOpen {\n            retry_after_secs: state.cfg.server.load.shed_retry_after_secs,\n            reason: \"Redis command timed out\".to_owned(),\n        },",
+        "        ExecError::Timeout => AppError::Internal(\"Redis command timed out\".to_owned()),",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "trace-layer-amplifies-shed-logs",
+        HTTP_MOD,
+        "TraceLayer::new_for_http().on_failure(())",
+        "TraceLayer::new_for_http()",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "tcp-nodelay-disabled",
+        MAIN,
+        "stream.set_nodelay(true)",
+        "stream.set_nodelay(false)",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "debt-forgiveness-shed-cause-unregistered",
+        OBSERVABILITY,
+        "        \"debt_forgiven_by_eviction\",",
+        "        \"debt_forgiven_by_eviction_broken\",",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "nightly-load-schedule-removed",
+        LOAD_WORKFLOW,
+        "  schedule:\n    - cron: \"17 5 * * *\"",
+        "  schedule_broken:\n    - cron: \"17 5 * * *\"",
+        Expectation::Killed,
+    ));
+
     all
 }
 
 #[test]
 #[ignore = "pre-release mutation sweep: rewrites a scratch copy of the crate and runs the suite \
-            once per mutation (~8 min warm, needs no Docker). CI runs plain `cargo test`, which \
+            once per mutation (~17 min warm, needs no Docker). CI runs plain `cargo test`, which \
             skips this. Run with: cargo test --test mutation_guard -- --ignored --nocapture"]
 fn every_locked_invariant_fails_the_suite_when_it_is_broken() {
     let root = crate_root();

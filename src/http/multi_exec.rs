@@ -63,7 +63,7 @@ pub async fn execute(
     let results = handle
         .transaction_and_release(commands)
         .await
-        .map_err(map_exec_error)?;
+        .map_err(|error| map_exec_error(error, &state))?;
     let mut budget = state.cfg.server.load.max_response_bytes;
     let encoding = response_encoding(&headers);
     let response = results

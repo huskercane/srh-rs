@@ -13,12 +13,12 @@ Wire compatibility with the `@upstash/redis` SDK is the top-level design require
 
 > ### Status: specification-complete, implementation in progress
 >
-> Phases 0–7 are implemented: the architecture scaffold, configuration, static-token and JWT
+> Phases 0–7 and 9 are implemented: the architecture scaffold, configuration, static-token and JWT
 > authentication, admission controls, RESP conversion, and all three Redis execution routes are
 > working with lazy bounded pools, Fred-level timeouts, circuit breaking, idle eviction,
 > command ACL enforcement, script allowlisting, debt-aware per-credential rate limiting,
 > bounded JWKS discovery, optional token introspection, readiness and Prometheus observability,
-> and production packaging.
+> production packaging, and the bend-not-break load gate.
 > The normative
 > specification is [`srh-rust-spec.md`](./srh-rust-spec.md), which defines ten phases; this
 > README documents the system that spec describes.
@@ -34,7 +34,7 @@ Wire compatibility with the `@upstash/redis` SDK is the top-level design require
 > | 6 | Keycloak JWT auth, JWKS, introspection | Done |
 > | 7 | Hardening, observability, packaging | Done |
 > | 8 | Key-prefix isolation | Deferred — out of the first delivery |
-> | 9 | Load-handling verification | Not started |
+> | 9 | Load-handling verification | Done |
 >
 > Sections for later phases describe the target contract; the status table identifies what is
 > currently implemented.
@@ -596,7 +596,20 @@ Verify before shipping to any shared host:
 - The fronting reverse proxy carries the per-IP rate limit. The proxy's own limiter is
   per-identity and runs after authentication, so JWT signature verification itself is
   unmetered — bounded only by `max_in_flight`.
-- Document `somaxconn` and the listen backlog for the host.
+- The Tokio/Mio listener requests a backlog of 128; Linux caps it at
+  `net.core.somaxconn`. Verify `sysctl net.core.somaxconn` is at least 128 (and size the fronting
+  reverse proxy's backlog for the same burst envelope). Accepted sockets explicitly enable
+  `TCP_NODELAY`.
+
+The nightly Phase 9 gate runs the overload, backend-death, and slow-client profiles at their
+normative 60-second timings. Run the same gate locally with Docker and Python 3:
+
+```bash
+./scripts/phase9-load.sh
+```
+
+For a quick harness check during development, use `PHASE9_SMOKE=1`; it shortens the two load
+profiles but retains every assertion and the configured 64 slow clients.
 
 ### systemd
 
@@ -661,7 +674,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 Before tagging a release, also run the mutation sweep, which breaks one invariant at a time in a
 scratch copy of the crate and asserts that some test notices. It is `#[ignore]`d so that CI skips
-it, takes about eight minutes on a warm cache, and needs no Docker:
+it, takes about seventeen minutes on a warm cache, and needs no Docker:
 
 ```bash
 cargo test --test mutation_guard -- --ignored --nocapture

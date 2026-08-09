@@ -9,8 +9,8 @@ acceptance criteria; do not proceed until they pass. Do not invent features not 
 spec. Wire compatibility with the `@upstash/redis` JavaScript SDK is the top-level
 requirement — where the spec says "exactly", match exactly.
 
-**Implementation status (2026-08-08):** Phases 0–7 are complete. Phase 8 remains deferred as
-specified; Phase 9 is next.
+**Implementation status (2026-08-09):** Phases 0–7 and 9 are complete. Phase 8 remains deferred
+as specified.
 
 **API-name caution:** dependency APIs change between versions. Type/method names in this
 spec are indicative; ALWAYS verify signatures against docs.rs for the exact version in
@@ -1189,6 +1189,8 @@ For identities with `key_prefix`, when built:
 ---
 
 ## Phase 9 — Load handling verification (bend-not-break gate)
+
+**Implementation status: complete (2026-08-09).**
 
 Most of the machinery is built in Phases 1/4 (admission stack, bounded pool queues,
 breaker, response budget). This phase verifies the SYSTEM property under real load and

@@ -1,0 +1,35 @@
+{
+  "server": {
+    "port": 80,
+    "bind": "0.0.0.0",
+    "http_timeout_ms": 5000,
+    "metrics_bind": "0.0.0.0:9090",
+    "load": {
+      "max_in_flight": 64,
+      "max_response_bytes": 1048576,
+      "shed_retry_after_secs": 1,
+      "body_read_timeout_ms": 2000
+    }
+  },
+  "auth": {
+    "static_tokens": {
+      "phase9-load-token": {
+        "pool": "load",
+        "allowed_commands": ["GET", "SET"]
+      }
+    }
+  },
+  "pools": {
+    "load": {
+      "connection_string": "redis://redis:6379",
+      "max_connections": 4,
+      "max_waiters": 4,
+      "acquire_timeout_ms": 250,
+      "command_timeout_ms": 1000,
+      "breaker": {
+        "failure_threshold": 3,
+        "cooldown_ms": 1000
+      }
+    }
+  }
+}

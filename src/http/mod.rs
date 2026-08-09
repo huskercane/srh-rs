@@ -41,7 +41,10 @@ pub fn router(state: AppState) -> Router {
     api.merge(observability)
         .fallback(not_found)
         .layer(middleware::from_fn(observability::observe_request))
-        .layer(TraceLayer::new_for_http())
+        // The structured audit middleware emits the one canonical completion event. The
+        // TraceLayer still supplies request spans, but its default failure callback logs every
+        // shed 503 at ERROR and can turn deliberate overload into a log-amplification attack.
+        .layer(TraceLayer::new_for_http().on_failure(()))
         .with_state(state)
 }
 

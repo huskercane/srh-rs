@@ -26,6 +26,7 @@ pub fn register_metrics(config: &crate::config::Config) {
         "acquire_timeout",
         "breaker_open",
         "response_too_large",
+        "debt_forgiven_by_eviction",
     ] {
         let _ = metrics::counter!("srh_shed_total", "cause" => cause);
     }

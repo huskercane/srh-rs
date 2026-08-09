@@ -209,6 +209,43 @@ async fn redis_errors_are_returned_verbatim() {
 }
 
 #[tokio::test]
+async fn transient_backend_failures_are_503_with_retry_after() {
+    for error in [
+        ExecError::Timeout,
+        ExecError::Transport("connection reset".to_owned()),
+    ] {
+        let config = Arc::new(
+            Config::from_json(
+                r#"{"server":{"load":{"shed_retry_after_secs":7}},"auth":{"static_tokens":{"right-token":{"pool":"cache"}}},"pools":{"cache":{"connection_string":"redis://localhost:6379"}}}"#,
+            )
+            .unwrap(),
+        );
+        let static_auth: Arc<dyn Authenticator> =
+            Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
+        let response = app_with_auth(
+            Arc::new(AuthChain::new(vec![static_auth])),
+            config,
+            Err(error),
+        )
+        .oneshot(
+            Request::post("/")
+                .header(header::AUTHORIZATION, "Bearer right-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"["PING"]"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "7");
+        assert_eq!(
+            response_json(response).await,
+            json!({ "error": "Backend unavailable" })
+        );
+    }
+}
+
+#[tokio::test]
 async fn oversized_response_fails_the_whole_request_with_bad_gateway() {
     // The commands DID execute; 502 means the reply could not be rendered
     // inside `load.max_response_bytes`. Clients must treat it as indeterminate.

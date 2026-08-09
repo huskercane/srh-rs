@@ -1,0 +1,22 @@
+name: Phase 9 load gate
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase9-load
+  cancel-in-progress: false
+
+jobs:
+  bend-not-break:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run overload, backend-death, and slow-client profiles
+        run: ./scripts/phase9-load.sh

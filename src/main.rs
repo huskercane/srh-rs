@@ -130,6 +130,10 @@ async fn main() -> Result<()> {
                         continue;
                     }
                 };
+                if let Err(error) = stream.set_nodelay(true) {
+                    tracing::warn!(%peer, %error, "failed to enable TCP_NODELAY");
+                    continue;
+                }
                 // The direct Hyper accept loop must supply the same peer extension Axum's
                 // `into_make_service_with_connect_info` would add, or `/ready` rejects everyone.
                 let service = TowerToHyperService::new(

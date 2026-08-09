@@ -36,6 +36,7 @@ fn phase_seven_metric_families_are_always_registered() {
         "acquire_timeout",
         "breaker_open",
         "response_too_large",
+        "debt_forgiven_by_eviction",
     ] {
         assert!(rendered.contains(&format!("cause=\"{cause}\"")));
     }

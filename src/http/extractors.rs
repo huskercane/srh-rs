@@ -47,7 +47,7 @@ impl FromRequestParts<AppState> for AuthedIdentity {
                 }
             })?
             .ok_or_else(|| unauthorized("rejected"))?;
-        state
+        let probe = state
             .rate_limiter
             .probe(&identity.bucket_key)
             .map_err(|error| {
@@ -55,7 +55,9 @@ impl FromRequestParts<AppState> for AuthedIdentity {
                 AppError::RateLimited {
                     retry_after_secs: error.retry_after_secs,
                 }
-            })?;
+            });
+        super::command::record_debt_forgiveness(state);
+        probe?;
         Ok(Self(identity))
     }
 }

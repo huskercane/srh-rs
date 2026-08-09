@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,7 @@ pub struct RateLimiter {
     clock: Arc<dyn Clock>,
     max_buckets: usize,
     buckets: Mutex<Buckets>,
+    debt_forgiven_evictions: AtomicU64,
 }
 
 impl RateLimiter {
@@ -50,6 +52,7 @@ impl RateLimiter {
             clock,
             max_buckets: max_buckets.max(1),
             buckets: Mutex::new(Buckets::default()),
+            debt_forgiven_evictions: AtomicU64::new(0),
         }
     }
 
@@ -137,13 +140,18 @@ impl RateLimiter {
             .len()
     }
 
+    /// Drains the number of hard-bound evictions that forgave an identity's live debt.
+    pub fn take_debt_forgiven_evictions(&self) -> u64 {
+        self.debt_forgiven_evictions.swap(0, Ordering::AcqRel)
+    }
+
     fn take_bucket(&self, buckets: &mut Buckets, key: &str, now: Instant) -> Bucket {
         if let Some(bucket) = buckets.entries.remove(key) {
             remove_order(buckets, key, &bucket);
             return bucket;
         }
-        if buckets.entries.len() >= self.max_buckets {
-            evict_one(buckets);
+        if buckets.entries.len() >= self.max_buckets && evict_one(buckets) {
+            self.debt_forgiven_evictions.fetch_add(1, Ordering::Relaxed);
         }
         Bucket {
             balance: self.capacity,
@@ -196,14 +204,19 @@ fn remove_order(buckets: &mut Buckets, key: &str, bucket: &Bucket) {
     index.remove(&order_key(key, bucket));
 }
 
-fn evict_one(buckets: &mut Buckets) {
-    let candidate = buckets.credit_lru.pop_first().or_else(|| {
+fn evict_one(buckets: &mut Buckets) -> bool {
+    let (candidate, forgave_debt) = if let Some(candidate) = buckets.credit_lru.pop_first() {
+        (Some(candidate), false)
+    } else {
         // At the hard bound, all retained identities may be indebted. Forgiving the oldest debt
         // is the deliberate bounded-memory fallback; normal idle sweeping never forgives debt.
-        buckets.debt_lru.pop_first()
-    });
+        (buckets.debt_lru.pop_first(), true)
+    };
     if let Some((_, _, key)) = candidate {
         buckets.entries.remove(&key);
+        forgave_debt
+    } else {
+        false
     }
 }
 
@@ -375,5 +388,8 @@ mod tests {
         assert!(!buckets.entries.contains_key("old-debt"));
         assert!(buckets.entries.contains_key("new-debt"));
         assert!(buckets.entries.contains_key("arrival"));
+        drop(buckets);
+        assert_eq!(limiter.take_debt_forgiven_evictions(), 1);
+        assert_eq!(limiter.take_debt_forgiven_evictions(), 0);
     }
 }
