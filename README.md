@@ -11,7 +11,7 @@ allowlisting, per-identity rate limiting, bounded pool queues, and circuit break
 
 Wire compatibility with the `@upstash/redis` SDK is the top-level design requirement.
 
-> ### Status: specification-complete, implementation in progress
+> ### Status: production-ready initial delivery
 >
 > Phases 0–7 and 9 are implemented: the architecture scaffold, configuration, static-token and JWT
 > authentication, admission controls, RESP conversion, and all three Redis execution routes are
@@ -74,7 +74,7 @@ docker run -d -p 8079:80 --name srh \
   -e SRH_MODE=env \
   -e SRH_TOKEN=your_token_here \
   -e SRH_CONNECTION_STRING="redis://your_server:6379" \
-  ghcr.io/<owner>/srh-rs:<digest>
+  ghcr.io/huskercane/srh-rs:v1.0.0
 ```
 
 Then point the SDK at it:
@@ -97,6 +97,58 @@ Pin images by digest, never by `:latest`.
 
 For anything beyond one token and one Redis, use a config file (`SRH_MODE=file`, the default).
 See [Configuration](#configuration).
+
+### Production setup
+
+Start from the checked-in [`tokens.example.json`](./srh-config/tokens.example.json). Copy it to
+`tokens.json`, replace the example token digest and Redis URL, and provision the Redis-side ACL
+user described in [Security model](#security-model). Keep the finished file root-owned and mode
+restricted as described below; it contains Redis and optional introspection credentials.
+
+```bash
+cp srh-config/tokens.example.json tokens.json
+chmod 0600 tokens.json
+# Edit tokens.json before starting the proxy.
+```
+
+For Docker, attach Redis and the proxy to a private Docker network, use the Redis service name in
+`connection_string` (not `localhost`), and mount the configuration read-only:
+
+```bash
+VERSION=1.0.0
+sudo chown root:65532 tokens.json
+sudo chmod 0640 tokens.json
+docker network create srh-backend
+docker run -d --name redis --restart unless-stopped --network srh-backend redis:7-alpine
+docker run -d --name srh --restart unless-stopped --network srh-backend \
+  -p 127.0.0.1:8079:80 \
+  -e SRH_MODE=file \
+  -e SRH_CONFIG_PATH=/etc/srh-rs/tokens.json \
+  -v "$PWD/tokens.json:/etc/srh-rs/tokens.json:ro" \
+  "ghcr.io/huskercane/srh-rs:v$VERSION"
+```
+
+The numeric group is the distroless image's `nonroot` group. It lets the non-root process read
+the bind mount without making the credentials world-readable; the `:ro` mount prevents writes.
+
+For a native systemd installation, download and verify the release archive as shown in
+[Artifacts](#artifacts), then install the binary, unit, and configuration:
+
+```bash
+RELEASE_DIR="srh-rs-v$VERSION-x86_64-unknown-linux-musl"
+sudo install -m 0755 "$RELEASE_DIR/srh-rs" /usr/local/bin/srh-rs
+sudo install -m 0644 "$RELEASE_DIR/deploy/srh-rs.service" /etc/systemd/system/srh-rs.service
+sudo install -d -m 0700 /etc/srh-rs
+sudo install -m 0600 tokens.json /etc/srh-rs/tokens.json
+sudo systemctl daemon-reload
+sudo systemctl enable --now srh-rs
+```
+
+The shipped unit uses a systemd credential so its `DynamicUser` can consume the root-owned
+`0600` configuration without making it broadly readable. In both deployment modes, keep Redis off the
+public network, put an HTTPS reverse proxy with a per-IP rate limit in front of the loopback HTTP
+listener, and expose the metrics listener only to the monitoring network. Confirm startup with
+`curl http://127.0.0.1:8079/health` for Docker or `systemctl status srh-rs` for systemd.
 
 ---
 
@@ -554,8 +606,25 @@ telemetry headers.
 
 ### Artifacts
 
+Prebuilt production artifacts are published on the
+[GitHub Releases page](https://github.com/huskercane/srh-rs/releases). Each release contains a
+stripped static `x86_64-unknown-linux-musl` binary archive, its SHA-256 checksum, the README, and
+the hardened systemd unit and example config. For example:
+
+```bash
+VERSION=1.0.0
+gh release download "v$VERSION" --repo huskercane/srh-rs \
+  --pattern 'srh-rs-*.tar.gz' --pattern 'srh-rs-*.tar.gz.sha256'
+sha256sum --check "srh-rs-v$VERSION-x86_64-unknown-linux-musl.tar.gz.sha256"
+tar -xzf "srh-rs-v$VERSION-x86_64-unknown-linux-musl.tar.gz"
+```
+
+The same release is published as a non-root distroless image at
+`ghcr.io/huskercane/srh-rs:v$VERSION`. Pin the digest reported by the release workflow when
+deploying; do not consume a mutable `latest` tag.
+
 The primary native-host artifact is a stripped static musl binary. Install the musl compiler,
-then run:
+then run the following when building from source:
 
 ```bash
 ./scripts/build-artifacts.sh
@@ -625,7 +694,8 @@ Ship as a static `x86_64-unknown-linux-musl` binary with `deploy/srh-rs.service`
 ```ini
 [Service]
 ExecStart=/usr/local/bin/srh-rs
-Environment=SRH_CONFIG_PATH=/etc/srh-rs/tokens.json
+LoadCredential=srh-config:/etc/srh-rs/tokens.json
+Environment=SRH_CONFIG_PATH=%d/srh-config
 DynamicUser=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -637,13 +707,8 @@ SystemCallFilter=@system-service
 Restart=on-failure
 ```
 
-Keep the config file mode 0600 and root-owned. The preferred systemd path is a credential:
-
-```ini
-[Service]
-LoadCredential=srh-config:/etc/srh-rs/tokens.json
-Environment=SRH_CONFIG_PATH=%d/srh-config
-```
+Keep the config file mode 0600 and root-owned. The shipped unit loads it through a systemd
+credential so the dynamic service user never needs direct access to `/etc/srh-rs`.
 
 Alternatively, create a dedicated `srh-rs-config` group, add
 `SupplementaryGroups=srh-rs-config` in a unit override, and grant that group an explicit read

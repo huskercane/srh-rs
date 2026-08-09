@@ -5,7 +5,8 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/srh-rs
-Environment=SRH_CONFIG_PATH=/etc/srh-rs/tokens.json
+LoadCredential=srh-config:/etc/srh-rs/tokens.json
+Environment=SRH_CONFIG_PATH=%d/srh-config
 DynamicUser=yes
 ProtectSystem=strict
 ProtectHome=yes
