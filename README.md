@@ -449,7 +449,7 @@ Provision it for every pool:
 
 ```
 ACL SETUSER srh-authkv on >STRONG_PASSWORD ~ww:auth:* \
-  +get +set +del +expireat +ttl +ping +hello +info +command|info \
+  +get +set +del +expireat +ttl +ping +info +command|info \
   +multi +exec +discard
 ```
 
@@ -463,16 +463,15 @@ Two traps worth knowing before you copy that:
   `INFO` while bootstrapping a connection, and key-prefix isolation (Phase 8) runs
   `COMMAND INFO` over this same Redis user. Both commands stay denied to ordinary HTTP
   identities; without both Redis-side grants, a properly provisioned pool can fail at first use.
-- **`+hello` and `+ping` are connection lifecycle grants.** They let the Redis client negotiate
-  and check its connection. They do not expose `HELLO` or `PING` through the proxy's command
-  policy unless the HTTP identity independently has permission.
 - **`+multi +exec +discard` are also for the proxy.** Direct transaction-state commands stay
   denied to HTTP clients because they would contaminate pooled connections, but `/multi-exec`
   uses these commands internally to execute one bounded transaction.
-- **Do not add `+hello` to this user.** `HELLO` changes protocol state on a pooled connection,
-  so its Layer A denial is a correctness boundary, not merely a permission check. Keeping it
-  absent from Layer B preserves defense in depth; the `HELLO`-is-always-403 regression test is
-  load-bearing if a deployment grants it for some external handshake requirement.
+- **Do not add `+hello` to this user.** Fred is forced to RESP2 and authenticates with `AUTH`,
+  so the proxy does not need `HELLO` to establish a connection. `HELLO` changes protocol state
+  on a pooled connection, so its Layer A denial is a correctness boundary, not merely a
+  permission check. Keeping it absent from Layer B preserves defense in depth; the
+  `HELLO`-is-always-403 regression test is load-bearing if a deployment grants it for some
+  external handshake requirement.
 
 ### Command policy
 

@@ -44,7 +44,7 @@ jobs:
         env:
           REDIS_CONTAINER: ${{ job.services.redis.id }}
         run: |
-          docker exec "$REDIS_CONTAINER" redis-cli ACL SETUSER srh-ci reset on '>ci-password' '~ci:*' +get +set +ping +hello +info +command\|info +multi +exec +discard
+          docker exec "$REDIS_CONTAINER" redis-cli ACL SETUSER srh-ci reset on '>ci-password' '~ci:*' +get +set +ping +info +command\|info +multi +exec +discard
           test "$(docker exec --env REDISCLI_AUTH=ci-password "$REDIS_CONTAINER" redis-cli --user srh-ci SET ci:allowed accepted)" = "OK"
           denied=$(docker exec --env REDISCLI_AUTH=ci-password "$REDIS_CONTAINER" redis-cli --user srh-ci SET other:key denied)
           case "$denied" in

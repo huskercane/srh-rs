@@ -24,15 +24,19 @@ fn runtime_and_scheduled_gates_keep_protections_wired() {
     );
 
     for document in [source("README.md"), source("srh-rust-spec.md")] {
-        for grant in ["+ping", "+hello", "+info", "+command|info"] {
+        for grant in ["+ping", "+info", "+command|info"] {
             assert!(document.contains(grant), "documentation omitted {grant}");
         }
+        assert!(document.contains("Do not") && document.contains("`+hello`"));
+        assert!(!document.contains("+ping +hello"));
+        assert!(!document.contains("`+hello` and `+ping`"));
         assert!(document.contains("+multi +exec +discard"));
     }
     let ci = source(".github/workflows/ci.yml");
-    for grant in ["+ping", "+hello", "+info", "+command\\|info"] {
+    for grant in ["+ping", "+info", "+command\\|info"] {
         assert!(ci.contains(grant), "CI Redis ACL omitted {grant}");
     }
+    assert!(!ci.contains("+hello"), "CI Redis ACL must not grant HELLO");
     assert!(ci.contains("+multi +exec +discard"));
     assert!(ci.contains("parity policy-scope skip:"));
     assert!(ci.contains("parity documented protocol skip:"));

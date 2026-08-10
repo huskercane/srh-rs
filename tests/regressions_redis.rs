@@ -152,7 +152,7 @@ async fn multi_is_denied_and_cannot_poison_a_pooled_connection() {
 /// `/multi-exec` runs a real Redis transaction, so the documented Layer B user needs
 /// `+multi`/`+exec`/`+discard` even though direct client transaction commands are denied.
 #[tokio::test]
-async fn the_documented_layer_b_user_can_still_serve_multi_exec() {
+async fn the_documented_layer_b_user_authenticates_without_hello_and_serves_multi_exec() {
     let (_container, port) = start_redis().await;
     let admin = FredExecutor::connect(
         &format!("redis://127.0.0.1:{port}"),
@@ -180,6 +180,7 @@ async fn the_documented_layer_b_user_can_still_serve_multi_exec() {
                 "+expireat",
                 "+ttl",
                 "+ping",
+                "+info",
                 "+command|info",
                 "+multi",
                 "+exec",

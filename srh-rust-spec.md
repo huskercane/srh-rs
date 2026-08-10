@@ -925,7 +925,7 @@ buy an unlimited number of maximum-size parses.
 **Redis-side ACL (Layer B) — document in README, verify in CI job 2:** example
 provisioning for an auth-KV pool:
 ```
-ACL SETUSER srh-authkv on >STRONG_PASSWORD ~ww:auth:* +get +set +del +expireat +ttl +ping +hello +info +command|info +multi +exec +discard
+ACL SETUSER srh-authkv on >STRONG_PASSWORD ~ww:auth:* +get +set +del +expireat +ttl +ping +info +command|info +multi +exec +discard
 ```
 Two traps to document alongside it:
 - **Key patterns must match the client's ACTUAL key roots.** The
@@ -938,14 +938,13 @@ Two traps to document alongside it:
   may issue `INFO` while bootstrapping a connection, and Phase 8 runs `COMMAND INFO`
   at pool build over this same Layer B user. Both commands stay denied to ordinary
   HTTP identities; without both grants, a properly-provisioned pool can fail at startup.
-- **`+hello` and `+ping` are connection lifecycle grants.** They allow negotiation
-  and health checks without granting those commands to HTTP identities.
 - **`+multi +exec +discard` are for the PROXY, not clients.** Direct transaction-state
   commands stay in HARD_DENY because they contaminate pooled connections; `/multi-exec`
   needs these grants for its internal bounded transaction.
-- **Do not grant `+hello`.** HELLO changes RESP version on a pooled connection, making
-  Layer A's denial a correctness guard as well as a permission check. The restricted
-  Layer B example intentionally retains that independent denial.
+- **Do not grant `+hello`.** Fred is forced to RESP2 and authenticates with `AUTH`, so it
+  does not need `HELLO` to establish a connection. `HELLO` changes RESP version on a pooled
+  connection, making Layer A's denial a correctness guard as well as a permission check.
+  The restricted Layer B example intentionally retains that independent denial.
 CI job 2 runs the integration suite against a Redis provisioned with a restricted ACL
 user and asserts that an EVAL smuggled past a hypothetically-broken Layer A still fails
 at Redis with a NOPERM error.
