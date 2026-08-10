@@ -75,7 +75,7 @@ mod tests {
     async fn ring_client_completes_a_real_tls_handshake() {
         let generated = generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
         let certificate = generated.cert.der().clone();
-        let private_key = PrivatePkcs8KeyDer::from(generated.key_pair.serialize_der());
+        let private_key = PrivatePkcs8KeyDer::from(generated.signing_key.serialize_der());
         let server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![certificate.clone()], private_key.into())

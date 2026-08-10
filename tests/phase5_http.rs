@@ -450,8 +450,8 @@ async fn colliding_log_subjects_still_use_isolated_full_digest_buckets() {
 #[test]
 fn collision_fixture_really_shares_only_the_short_subject() {
     use sha2::{Digest, Sha256};
-    let digests = ["phase5-token-45101", "phase5-token-67122"]
-        .map(|token| format!("{:x}", Sha256::digest(token.as_bytes())));
-    assert_eq!(&digests[0][..8], &digests[1][..8]);
+    let digests: [[u8; 32]; 2] = ["phase5-token-45101", "phase5-token-67122"]
+        .map(|token| Sha256::digest(token.as_bytes()).into());
+    assert_eq!(&digests[0][..4], &digests[1][..4]);
     assert_ne!(digests[0], digests[1]);
 }

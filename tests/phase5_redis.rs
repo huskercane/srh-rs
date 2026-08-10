@@ -77,7 +77,10 @@ async fn an_allowlisted_eval_is_still_confined_by_the_redis_acl_user() {
     assert_eq!(result, RespValue::Simple("OK".to_owned()));
 
     let script = "return redis.call('SET', KEYS[1], ARGV[1])";
-    let script_sha256 = format!("{:x}", Sha256::digest(script.as_bytes()));
+    let script_sha256 = Sha256::digest(script.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     let config = Arc::new(
         Config::from_json(
             &json!({
