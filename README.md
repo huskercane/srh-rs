@@ -39,9 +39,9 @@ Wire compatibility with the `@upstash/redis` SDK is the top-level design require
 > Sections for later phases describe the target contract; the status table identifies what is
 > currently implemented.
 >
-> Compatibility note: the upstream SDK gate is pinned to a commit dated 2023-10-19 while
-> its runner is migrated from Deno to Bun; see [issue #3](https://github.com/huskercane/srh-rs/issues/3)
-> and [Development](#development).
+> Compatibility note: the Bun parity gate tracks the reviewed `@upstash/redis` 1.38.2 release
+> commit dated 2026-08-04. The exact SDK, Bun, and Redis Stack pins are recorded in
+> [Development](#development).
 
 ---
 
@@ -800,11 +800,27 @@ behavior is covered by the all-features integration job, but not by the per-muta
 Mutation kills include both behavioral tests and a small set of explicit source-wiring assertions
 for the composition root and workflow files; those wiring kills are not behavioral coverage.
 
-CI also runs the pinned, last Deno-compatible upstream Upstash suite at commit
-`1298187065cb802720b876ff9efcf2e9d7d408ef` (2023-10-19) against Redis Stack and the built
-image. The current upstream suite uses Bun, so moving that pin requires explicitly migrating
-the gate; [issue #3](https://github.com/huskercane/srh-rs/issues/3) tracks that work. Files under
-`ci/upstash-parity-policy-scope.txt` exercise commands the Phase 5 ACL intentionally denies and
-are outside protocol comparison; `ci/upstash-parity-skips.txt` contains only §1.7 protocol
-differences. The historical suite's dead `denopkg.com` import is remapped to the same tagged
-source on GitHub by the checked-in import map.
+CI runs the upstream Bun suite from `@upstash/redis` 1.38.2 commit
+`fc3089b69f583bc2a34bb1c4f9b8871891408cdc` (2026-08-04), using Bun 1.3.6 and the pinned
+Redis Stack image digest in `.github/workflows/ci.yml`, against the release image built by that
+same job. At this pin the gate executes 701 upstream tests: 685 pass and 16 narrowly patched
+tests are skipped, in addition to whole-file scope exclusions listed below.
+
+The exclusions are deliberately separated so a security-policy failure cannot be relabeled as
+wire compatibility:
+
+- `ci/upstash-parity-policy-scope.txt` and `ci/upstash-parity-policy.patch` cover commands the
+  Phase 5 ACL intentionally denies, including scripting, pub/sub, functions, and `MEMORY USAGE`.
+- `ci/upstash-parity-skips.txt` and `ci/upstash-parity-protocol.patch` contain only documented
+  Upstash-vs-Redis HTTP or response-semantic differences.
+- `ci/upstash-parity-backend-scope.txt` and `ci/upstash-parity-backend.patch` cover Upstash
+  service features and commands unavailable in the pinned Redis Stack backend.
+
+The upstream suite still has no `/multi-exec` EXEC-time slot-error case. The local raw HTTP and
+Redis-backed regression tests remain the load-bearing lock for that response shape.
+
+To refresh the gate, choose the latest stable `@upstash/redis` tag, resolve it to an immutable
+commit, record its release date, and update the checkout plus the reviewed Bun and Redis Stack
+pins together. Apply every manifest and patch to a clean checkout, run the complete upstream
+suite, and review each changed exclusion in its existing category. A policy exclusion must never
+move into the protocol list merely to make the gate pass.

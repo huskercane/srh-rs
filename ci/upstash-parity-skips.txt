@@ -1,3 +1,4 @@
-pkg/commands/json_get.test.ts
-pkg/commands/json_mget.test.ts
-pkg/commands/json_objlen.test.ts
+packages/redis/pkg/commands/json_get.test.ts
+packages/redis/pkg/commands/json_mget.test.ts
+packages/redis/pkg/commands/json_objlen.test.ts
+packages/redis/pkg/read-your-writes.test.ts

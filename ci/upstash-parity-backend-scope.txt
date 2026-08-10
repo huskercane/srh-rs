@@ -1,0 +1,6 @@
+packages/redis/pkg/commands/hgetdel.test.ts
+packages/redis/pkg/commands/hgetex.test.ts
+packages/redis/pkg/commands/hsetex.test.ts
+packages/redis/pkg/commands/search/search.test.ts
+packages/redis/pkg/commands/xackdel.test.ts
+packages/redis/pkg/commands/xdelex.test.ts

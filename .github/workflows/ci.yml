@@ -60,12 +60,28 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - name: Check out the pinned Deno-compatible Upstash suite
+      - name: Check out the pinned Upstash suite
         uses: actions/checkout@v4
         with:
           repository: upstash/redis-js
-          ref: 1298187065cb802720b876ff9efcf2e9d7d408ef
+          # @upstash/redis 1.38.2, released 2026-08-04.
+          ref: fc3089b69f583bc2a34bb1c4f9b8871891408cdc
           path: upstash-redis
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: upstash-redis/pnpm-lock.yaml
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # Match the @types/bun version reviewed in the pinned upstream tree.
+          bun-version: 1.3.6
+      - name: Install the pinned upstream dependencies
+        working-directory: upstash-redis
+        run: pnpm install --frozen-lockfile
       - name: Build the release image
         run: docker build --tag srh-rs:ci .
       - name: Verify and retain the static artifact
@@ -86,16 +102,19 @@ jobs:
       - name: Start Redis Stack and srh-rs
         run: |
           docker network create srh-parity
-          docker run --detach --name redis-stack --network srh-parity redis/redis-stack-server:6.2.6-v6
-          docker run --detach --name srh --network srh-parity \
+          docker run --detach --name redis-stack --network srh-parity \
+            redis/redis-stack-server@sha256:798ab84d9f266936b034ab11c4d04a2b8e4b441884c5aa7d17ac951eefdf742a
+          docker run --detach --name srh --network srh-parity --publish 127.0.0.1:18080:80 \
             --env SRH_MODE=env \
             --env SRH_TOKEN=example_token \
             --env SRH_CONNECTION_STRING=redis://redis-stack:6379 \
+            --env SRH_MAX_CONNECTIONS=64 \
             srh-rs:ci
-      - name: Prepare the pinned historical suite
+      - name: Prepare the pinned upstream suite
         run: |
-          cp ci/upstash-parity-import-map.json upstash-redis/srh-import-map.json
-          git -C upstash-redis apply ../ci/upstash-parity.patch
+          git -C upstash-redis apply ../ci/upstash-parity-policy.patch
+          git -C upstash-redis apply ../ci/upstash-parity-protocol.patch
+          git -C upstash-redis apply ../ci/upstash-parity-backend.patch
           while IFS= read -r file; do
             echo "parity policy-scope skip: $file"
             mv "upstash-redis/$file" "upstash-redis/$file.policy-scope"
@@ -104,24 +123,26 @@ jobs:
             echo "parity documented protocol skip: $file"
             mv "upstash-redis/$file" "upstash-redis/$file.documented-skip"
           done < ci/upstash-parity-skips.txt
+          while IFS= read -r file; do
+            echo "parity backend-scope skip: $file"
+            mv "upstash-redis/$file" "upstash-redis/$file.backend-scope"
+          done < ci/upstash-parity-backend-scope.txt
       - name: Wait for the proxy
         run: |
           for attempt in $(seq 1 60); do
-            if docker run --rm --network srh-parity curlimages/curl:8.14.1 --fail --silent http://srh:80/health >/dev/null; then
+            if curl --fail --silent http://127.0.0.1:18080/health >/dev/null; then
               exit 0
             fi
             sleep 1
           done
           docker logs srh
           exit 1
-      - name: Run the upstream Deno parity suite
-        run: |
-          docker run --rm --network srh-parity \
-            --volume "$PWD/upstash-redis:/work" \
-            --workdir /work \
-            --env UPSTASH_REDIS_REST_URL=http://srh:80 \
-            --env UPSTASH_REDIS_REST_TOKEN=example_token \
-            denoland/deno:1.37.2 test -A ./pkg
+      - name: Run the upstream Bun parity suite
+        working-directory: upstash-redis/packages/redis
+        env:
+          UPSTASH_REDIS_REST_URL: http://127.0.0.1:18080
+          UPSTASH_REDIS_REST_TOKEN: example_token
+        run: bun test pkg --bail --timeout 20000
       - name: Log in to GHCR
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3

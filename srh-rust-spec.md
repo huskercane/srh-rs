@@ -10,9 +10,9 @@ spec. Wire compatibility with the `@upstash/redis` JavaScript SDK is the top-lev
 requirement — where the spec says "exactly", match exactly.
 
 **Implementation status (2026-08-10):** Phases 0–7 and 9 are complete. Phase 8 remains deferred
-as specified. The upstream compatibility gate is pinned to SDK commit
-`1298187065cb802720b876ff9efcf2e9d7d408ef` dated 2023-10-19 pending its Deno-to-Bun migration
-([issue #3](https://github.com/huskercane/srh-rs/issues/3)).
+as specified. The Bun compatibility gate is pinned to `@upstash/redis` 1.38.2 commit
+`fc3089b69f583bc2a34bb1c4f9b8871891408cdc` dated 2026-08-04, with its runner and Redis Stack
+backend pinned alongside it in CI.
 
 **API-name caution:** dependency APIs change between versions. Type/method names in this
 spec are indicative; ALWAYS verify signatures against docs.rs for the exact version in
@@ -1161,11 +1161,11 @@ must not fall through to a same-value static credential.
   1. `cargo fmt --check`, `clippy -D warnings`, `cargo test`.
   2. Integration: redis:7 provisioned with a restricted ACL user; run the repo's
      integration suite including the Layer B assertion (Phase 5).
-  3. **Upstash parity gate**: services `redis/redis-stack-server:6.2.6-v6` + built
-     image (SRH_MODE=env, SRH_TOKEN=example_token); container `denoland/deno`; checkout
-     `upstash/upstash-redis`; `deno test -A ./pkg` with
-     `UPSTASH_REDIS_REST_URL=http://srh:80`. Failures attributable ONLY to §1.7 items
-     get documented skip-list entries; anything else is a bug.
+  3. **Upstash parity gate**: immutable Redis Stack digest + built image
+     (`SRH_MODE=env`, `SRH_TOKEN=example_token`); checkout the immutable
+     `@upstash/redis` 1.38.2 commit and run its `packages/redis/pkg` suite with Bun 1.3.6.
+     Intentional ACL denials, documented protocol differences, and pinned-backend limitations
+     have separate manifests and patches; anything outside those reviewed scopes is a bug.
 
 ### Phase 7 acceptance
 - All CI jobs green; legacy docker command works; image < 25 MB; musl binary runs on a

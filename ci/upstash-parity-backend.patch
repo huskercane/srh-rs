@@ -1,0 +1,53 @@
+diff --git a/packages/redis/pkg/commands/bitop.test.ts b/packages/redis/pkg/commands/bitop.test.ts
+index ef5a318..e557b12 100644
+--- a/packages/redis/pkg/commands/bitop.test.ts
++++ b/packages/redis/pkg/commands/bitop.test.ts
+@@ -43,7 +43,7 @@ describe("when key is set", () => {
+     });
+   });
+ 
+-  describe("diff", () => {
++  describe.skip("diff", () => {
+     test("sets bits that are in X but not in any Y", async () => {
+       const x = newKey();
+       const y1 = newKey();
+@@ -61,7 +61,7 @@ describe("when key is set", () => {
+     });
+   });
+ 
+-  describe("diff1", () => {
++  describe.skip("diff1", () => {
+     test("sets bits that are in Y but not in X", async () => {
+       const x = newKey();
+       const y1 = newKey();
+@@ -79,7 +79,7 @@ describe("when key is set", () => {
+     });
+   });
+ 
+-  describe("andor", () => {
++  describe.skip("andor", () => {
+     test("sets bits that are in X AND in one or more Y", async () => {
+       const x = newKey();
+       const y1 = newKey();
+@@ -97,7 +97,7 @@ describe("when key is set", () => {
+     });
+   });
+ 
+-  describe("one", () => {
++  describe.skip("one", () => {
+     test("sets bits that are in exactly one source", async () => {
+       const x1 = newKey();
+       const x2 = newKey();
+diff --git a/packages/redis/pkg/redis.test.ts b/packages/redis/pkg/redis.test.ts
+index 8a07ff3..4750274 100644
+--- a/packages/redis/pkg/redis.test.ts
++++ b/packages/redis/pkg/redis.test.ts
+@@ -267,7 +267,7 @@ describe("return type of scan withType", () => {
+   });
+ });
+ 
+-describe("search", () => {
++describe.skip("search", () => {
+   test(
+     "should create index, seed data, and query",
+     async () => {

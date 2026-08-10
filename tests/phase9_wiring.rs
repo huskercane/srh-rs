@@ -36,6 +36,14 @@ fn runtime_and_scheduled_gates_keep_protections_wired() {
     assert!(ci.contains("+multi +exec +discard"));
     assert!(ci.contains("parity policy-scope skip:"));
     assert!(ci.contains("parity documented protocol skip:"));
+    assert!(ci.contains("parity backend-scope skip:"));
+    assert!(ci.contains("fc3089b69f583bc2a34bb1c4f9b8871891408cdc"));
+    assert!(ci.contains("bun-version: 1.3.6"));
+    assert!(ci.contains("bun test pkg --bail --timeout 20000"));
+    assert!(ci.contains("upstash-parity-policy.patch"));
+    assert!(ci.contains("upstash-parity-protocol.patch"));
+    assert!(ci.contains("upstash-parity-backend.patch"));
+    assert!(!ci.contains("denoland/deno"));
 
     let shell = source("scripts/phase9-load.sh");
     for profile in ["overload", "backend-death", "slow-client"] {

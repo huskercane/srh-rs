@@ -1,0 +1,52 @@
+diff --git a/packages/redis/pkg/commands/copy.test.ts b/packages/redis/pkg/commands/copy.test.ts
+index 57552e3..d59ac25 100644
+--- a/packages/redis/pkg/commands/copy.test.ts
++++ b/packages/redis/pkg/commands/copy.test.ts
+@@ -47,7 +47,7 @@ describe("COPY test", () => {
+     expect(res).toEqual("NOT_COPIED");
+   });
+ 
+-  test("should handle same source and destination keys", async () => {
++  test.skip("should handle same source and destination keys", async () => {
+     const key = newKey();
+     const value = randomID();
+     await new SetCommand([key, value]).exec(client);
+diff --git a/packages/redis/pkg/commands/scan.test.ts b/packages/redis/pkg/commands/scan.test.ts
+index 55835b5..9e27262 100644
+--- a/packages/redis/pkg/commands/scan.test.ts
++++ b/packages/redis/pkg/commands/scan.test.ts
+@@ -91,7 +91,7 @@ describe("with type", () => {
+   });
+ });
+ 
+-describe("with withType", () => {
++describe.skip("with withType", () => {
+   test("returns cursor and keys with types", async () => {
+     await new FlushDBCommand([]).exec(client);
+     const stringKey = newKey();
+diff --git a/packages/redis/pkg/commands/xreadgroup.test.ts b/packages/redis/pkg/commands/xreadgroup.test.ts
+index df49a8c..e21c3a5 100644
+--- a/packages/redis/pkg/commands/xreadgroup.test.ts
++++ b/packages/redis/pkg/commands/xreadgroup.test.ts
+@@ -57,7 +57,7 @@ describe("COUNT", () => {
+ });
+ 
+ describe("NOACK", () => {
+-  test("should return 0 items in PEL", async () => {
++  test.skip("should return 0 items in PEL", async () => {
+     const streamKey = newKey();
+     const group = newKey();
+     const consumer = newKey();
+diff --git a/packages/redis/pkg/commands/xtrim.test.ts b/packages/redis/pkg/commands/xtrim.test.ts
+index 2b6be6f..e51ee5f 100644
+--- a/packages/redis/pkg/commands/xtrim.test.ts
++++ b/packages/redis/pkg/commands/xtrim.test.ts
+@@ -11,7 +11,7 @@ const { newKey, cleanup } = keygen();
+ afterAll(cleanup);
+ 
+ describe("XLEN", () => {
+-  test(
++  test.skip(
+     "should approximately trim stream to 30 items",
+     async () => {
+       const key = newKey();
