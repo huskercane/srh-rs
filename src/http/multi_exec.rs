@@ -6,6 +6,7 @@ use serde_json::json;
 
 use crate::AppState;
 use crate::domain::convert::{json_args_to_redis, redis_value_to_json};
+use crate::domain::resp::ExecError;
 use crate::error::AppError;
 use crate::http::command::{
     charge_rate_limit, map_acquire_error, map_exec_error, response_encoding,
@@ -68,9 +69,17 @@ pub async fn execute(
     let encoding = response_encoding(&headers);
     let response = results
         .into_iter()
-        .map(|value| {
-            redis_value_to_json(value, encoding, &mut budget)
+        .map(|result| match result {
+            Ok(value) => redis_value_to_json(value, encoding, &mut budget)
                 .map(|value| json!({ "result": value }))
+                .map_err(AppError::from),
+            Err(ExecError::Redis(message)) => Ok(json!({ "error": message })),
+            Err(ExecError::ResponseTooLarge) => Err(AppError::ResponseTooLarge),
+            Err(ExecError::Timeout) => Ok(json!({ "error": "Redis command timed out" })),
+            Err(ExecError::Transport(message)) => {
+                tracing::error!(error = %message, "transaction command transport failure");
+                Ok(json!({ "error": "Internal server error" }))
+            }
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(response).into_response())

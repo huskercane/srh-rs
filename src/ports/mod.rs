@@ -21,7 +21,10 @@ pub trait CommandExecutor: Send + Sync {
 
     async fn pipeline(&self, cmds: Vec<RedisCommand>) -> Vec<Result<RespValue, ExecError>>;
 
-    async fn transaction(&self, cmds: Vec<RedisCommand>) -> Result<Vec<RespValue>, ExecError>;
+    async fn transaction(
+        &self,
+        cmds: Vec<RedisCommand>,
+    ) -> Result<Vec<Result<RespValue, ExecError>>, ExecError>;
 }
 
 /// An acquired executor whose opaque lease is released when the handle drops.
@@ -65,7 +68,7 @@ impl ExecutorHandle {
     pub async fn transaction_and_release(
         self,
         commands: Vec<RedisCommand>,
-    ) -> Result<Vec<RespValue>, ExecError> {
+    ) -> Result<Vec<Result<RespValue, ExecError>>, ExecError> {
         let results = self.executor.transaction(commands).await;
         drop(self);
         results
@@ -123,7 +126,10 @@ mod tests {
             unreachable!("executor is not invoked by this ownership test")
         }
 
-        async fn transaction(&self, _cmds: Vec<RedisCommand>) -> Result<Vec<RespValue>, ExecError> {
+        async fn transaction(
+            &self,
+            _cmds: Vec<RedisCommand>,
+        ) -> Result<Vec<Result<RespValue, ExecError>>, ExecError> {
             unreachable!("executor is not invoked by this ownership test")
         }
     }
@@ -172,8 +178,8 @@ mod tests {
             async fn transaction(
                 &self,
                 cmds: Vec<RedisCommand>,
-            ) -> Result<Vec<RespValue>, ExecError> {
-                Ok(vec![RespValue::Simple("OK".to_owned()); cmds.len()])
+            ) -> Result<Vec<Result<RespValue, ExecError>>, ExecError> {
+                Ok(vec![Ok(RespValue::Simple("OK".to_owned())); cmds.len()])
             }
         }
 

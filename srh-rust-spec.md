@@ -1,4 +1,4 @@
-# SRH-RS: Upstash-compatible Redis HTTP proxy in Rust — Implementation Spec v2
+# SRH-RS: Upstash-compatible Redis HTTP proxy in Rust — Implementation Spec v10
 
 Rust rewrite of [hiett/serverless-redis-http](https://github.com/hiett/serverless-redis-http)
 with hardened security: JWT auth (Keycloak), Redis-side ACL enforcement, read-only tokens,
@@ -9,8 +9,10 @@ acceptance criteria; do not proceed until they pass. Do not invent features not 
 spec. Wire compatibility with the `@upstash/redis` JavaScript SDK is the top-level
 requirement — where the spec says "exactly", match exactly.
 
-**Implementation status (2026-08-09):** Phases 0–7 and 9 are complete. Phase 8 remains deferred
-as specified.
+**Implementation status (2026-08-10):** Phases 0–7 and 9 are complete. Phase 8 remains deferred
+as specified. The upstream compatibility gate is pinned to SDK commit
+`1298187065cb802720b876ff9efcf2e9d7d408ef` dated 2023-10-19 pending its Deno-to-Bun migration
+([issue #3](https://github.com/huskercane/srh-rs/issues/3)).
 
 **API-name caution:** dependency APIs change between versions. Type/method names in this
 spec are indicative; ALWAYS verify signatures against docs.rs for the exact version in
@@ -143,7 +145,8 @@ pub struct RedisCommand { pub name: String, pub args: Vec<bytes::Bytes> }
 pub trait CommandExecutor: Send + Sync {
     async fn execute(&self, cmd: RedisCommand) -> Result<RespValue, ExecError>;
     async fn pipeline(&self, cmds: Vec<RedisCommand>) -> Vec<Result<RespValue, ExecError>>;
-    async fn transaction(&self, cmds: Vec<RedisCommand>) -> Result<Vec<RespValue>, ExecError>;
+    async fn transaction(&self, cmds: Vec<RedisCommand>)
+        -> Result<Vec<Result<RespValue, ExecError>>, ExecError>;
 }
 
 #[async_trait]
@@ -278,9 +281,9 @@ Non-Redis per-slot failures remain HTTP 200: timeout uses
 `{"error":"Redis command timed out"}` and transport failures use the redacted
 `{"error":"Internal server error"}`. These are synthetic application errors, not
 raw Redis errors, and transport details are logged server-side only.
-Multi-exec success → 200 array mapped 1:1 from EXEC reply. Queue-time failure →
-DISCARD, then 400 `{"error":"<raw>"}`. EXEC-time slot failure → 400 raw after
-Redis has executed the transaction; successful commands are not rolled back (§1.7).
+Multi-exec EXEC reply → 200 array mapped 1:1, including EXEC-time errors as
+`{"error":"<raw>"}` slots. Queue-time failure → DISCARD, then 400
+`{"error":"<raw>"}`. A nil EXEC reply (EXECABORT/WATCH failure) is also 400.
 
 ### 1.5 RESP → JSON (`convert.rs::redis_value_to_json`)
 
@@ -308,23 +311,19 @@ preserve:
 Lossy UTF-8 conversion of non-UTF8 bulks applies ONLY in non-encoded mode (§1.5).
 Applies identically to all three endpoints.
 
-### 1.7 Deliberate differences vs Upstash (do not "fix")
+### 1.7 Known differences vs Upstash
 
 - `UNLINK` with 0 keys returns the real Redis error
 - `ZRANGE` requires BYSCORE/BYLEX for LIMIT
 - RedisJSON responses may differ subtly
-- Fred's public transaction API collapses valid UTF-8 bulk and simple strings into
-  the same `Value::String`. Therefore, in base64 mode only, a bulk value whose bytes
-  are exactly `OK` inside `/multi-exec` is returned as `"OK"` rather than `"T0s="`.
-  Single-command and pipeline execution use raw frames and do not have this divergence.
-- An EXEC-time command error does not roll back Redis transactions. `/multi-exec`
-  returns 400 with the raw failing-slot error and omits successful slot results,
-  but other queued commands may already have committed. `DISCARD` applies only to
-  queue-time failure before EXEC begins.
+
+Direct transaction-state commands (`MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`)
+are denied, matching the stateless Upstash REST surface. `/multi-exec` preserves raw
+EXEC frames, including simple-vs-bulk framing and per-slot Redis errors.
 
 The Phase 7 upstream parity gate scopes out SDK tests whose command is intentionally denied by
 the Phase 5 ACL. Those are authorization-policy cases, not wire-protocol comparisons. Protocol
-failures may be skipped only for the deliberate differences above; the two lists remain separate
+failures may be skipped only for the known differences above; the two lists remain separate
 and reviewable under `ci/`.
 
 ---
@@ -503,7 +502,8 @@ token; `subject` = first 8 hex chars of the digest.
 
 Auth composition: `AuthChain` (composite `Authenticator`) holds an ordered
 `Vec<Arc<dyn Authenticator>>`. Each link returns `Ok(None)` for "not my token format,
-try next" (e.g. `JwtAuth` when the token doesn't have exactly two `.` separators),
+try next" (e.g. `JwtAuth` when the first dot-delimited segment does not decode as a
+base64url JSON JWT header),
 `Ok(Some(identity))` on success, `Err` for a definitive rejection (recognized format,
 failed verification — do NOT fall through to the next link: a JWT that fails signature
 must never be retried as a static token). Chain exhausted → 401. Phase 1 wires
@@ -543,7 +543,8 @@ must never be retried as a static token). Chain exhausted → 401. Phase 1 wires
 - The direct listener is HTTP/1.1 only so Hyper's three-second header-read timeout can be
   configured explicitly. Deployments needing HTTP/2 terminate it at the reverse proxy.
 - `GET /health` (any interface): 200 `{"status":"ok"}`, liveness only, no Redis I/O,
-  never shed.
+  never shed. This deliberately sits outside `max_in_flight`, so liveness traffic is
+  unbounded inside the process; public binds rely on the reverse proxy's health-path limit.
 - Bind per config. **Graceful shutdown:** on SIGTERM/SIGINT, stop accepting new
   connections, drain in-flight requests with a 15s deadline using Hyper Util's
   `GracefulShutdown`, then `quit()` all pools, then exit. In-flight work
@@ -558,7 +559,7 @@ must never be retried as a static token). Chain exhausted → 401. Phase 1 wires
 ### Phase 1 acceptance
 - Unit tests: legacy parse, new parse, env normalization, plaintext-hashed-at-load,
   `sha256:` match, missing-pool failure, timeout-ordering validation failure.
-- Wrong token → 401 JSON; right token → 501.
+- Wrong token → 401 JSON; a right token passes authentication and reaches the route handler.
 - Grep test: no plaintext token ever appears in any log line.
 
 ---
@@ -628,6 +629,9 @@ Execute the remainder by polling ordered `custom_raw` futures together with
 `futures_util::future::join_all`. Do NOT spawn one task per command: task scheduling
 can reorder dependent commands before they enter Fred's queue. The order-dependent
 integration test is the regression lock for Fred's first-poll enqueue behavior.
+`join_all` polling in construction order is current `futures-util` behavior, not a
+documented API guarantee; treat the ordering test as a required upgrade gate for every
+`futures-util` version change.
 Do NOT issue sequential awaited round-trips. Preserve original slot order. Always
 HTTP 200 — with ONE exception: `ResponseTooLarge` (budget exhaustion
 during conversion) fails the whole request with 502 per error.rs; see the caveat
@@ -642,21 +646,22 @@ the command beyond the pipeline cap is consumed as `IgnoredAny`. Budget exhausti
 returns 400 `{"error":"Request too complex"}`.
 
 **multi_exec.rs**: validate ALL commands (shape + ACL) before touching Redis. An ACL
-denial → 403, while an invalid command shape → 400; either way nothing is sent. Use
-fred's transaction API — and
-**verify against the locked fred version that its transaction pins/buffers onto a
-single connection such that no other request's commands can interleave between MULTI
-and EXEC** (fred multiplexes and the Pool round-robins; the semaphore bounds
-requests, NOT connections, so nothing in srh-rs's own design prevents interleaving —
-the guarantee must come from fred's transaction implementation, and the test below
-proves it rather than assumes it). Queue-time failure → DISCARD + 400 raw;
-EXEC-time slot failure → 400 raw with no rollback (§1.7). Success → 200 mapped array.
+denial → 403, while an invalid command shape → 400; either way nothing is sent. Hold
+the acquired client's exclusive lease across raw-frame `MULTI`, queueing, and `EXEC`;
+Fred's public transaction value conversion cannot preserve error elements or
+simple-vs-bulk framing. Queue-time failure → `DISCARD` + 400 raw; nil EXEC → 400;
+an EXEC array → 200 mapped 1:1, with each error frame rendered as an `error` slot.
+The per-client lease, not only the request semaphore, prevents another request from
+interleaving commands into this transaction. The concurrency test below proves that
+isolation rather than assuming it.
 
 ### Phase 3 acceptance
 - Pipeline, failing middle command: 200; slot 1 error, slots 0/2 succeed.
 - Pipeline with an ACL-denied command mixed in: 200; denied slot has NOPERM; others ran.
 - Pipeline of 1001 commands with default cap → 400.
 - Multi-exec happy path; invalid-command multi-exec → 400 and no keys written.
+- Multi-exec EXEC-time middle-command error → 200 with successful slots on both sides
+  and the raw Redis error in the middle slot; verify the successful writes committed.
 - **Transaction isolation under concurrency:** against a `max_connections: 1` pool,
   run 20 concurrent multi-exec requests interleaved with 50 concurrent single
   commands; assert every transaction's results correspond exactly to its own
@@ -741,9 +746,11 @@ struct PoolEntry {
   acquire + command + reset budget described above.
 - `readiness()` PINGs only already-built pools but deliberately bypasses request permits,
   waiter slots, and breaker admission. Readiness measures backend health, not saturation;
-  it must not remove a busy healthy instance from rotation or consume a half-open traffic
-  probe. It still uses Fred's bounded command timeout/reset path and does not touch idle
-  timestamps.
+  it must not consume a half-open traffic probe. Probe all built pools concurrently and
+  give each probe an independent deadline of at most 500 ms (shorter if the pool command
+  timeout is shorter); a pool that does not answer by then is unavailable. Do not cancel a
+  Redis future when the readiness deadline expires: detach it so it completes Fred's normal
+  timeout/reset path and cannot leave an unread reply. Readiness does not touch idle timestamps.
 - Background task (60s): evict entries idle > 900s via `pool.quit()`; also sweeps rate
   buckets (Phase 5). `tracing::info!` + metrics counter per eviction.
 
@@ -853,7 +860,7 @@ SCRIPT, FUNCTION
    FLUSHALL, FLUSHDB, KEYS, RANDOMKEY, INFO, DBSIZE — unless explicitly listed in
    `allowed_commands` or by the server's explicit ADMIN_ALLOW set; legacy tokens exempt. SCAN remains
    available to rw tokens deliberately: it is the paginated, non-blocking iteration
-   primitive, and blocking it pushes users toward worse patterns).
+   primitive, and blocking it pushes users toward worse patterns.
 
 5. `allowed_commands` if Some → must contain the command.
 
@@ -897,7 +904,7 @@ token drive `rate × max_pipeline_commands` commands/sec through it.
 **Debt semantics (required):** the bucket balance MAY go negative. A request is
 admitted whenever the balance is > 0 BEFORE charging; the charge is then applied
 in full, possibly driving the balance negative, and the token is throttled until
-refill brings it positive again. **Rejected requests are NOT charged.** Rationale: a classic bucket can never admit a
+refill brings it positive again. **Rate-limit rejections are NOT charged.** Rationale: a classic bucket can never admit a
 request costing more than capacity, which would silently turn the rate limit
 into a hard pipeline-size cap (with rps=10/capacity 20, every pipeline over 20
 commands would be a permanent 429 — and `@upstash/redis` batches automatically,
@@ -936,13 +943,17 @@ Two traps to document alongside it:
 - **`+multi +exec +discard` are for the PROXY, not clients.** Direct transaction-state
   commands stay in HARD_DENY because they contaminate pooled connections; `/multi-exec`
   needs these grants for its internal bounded transaction.
+- **Do not grant `+hello`.** HELLO changes RESP version on a pooled connection, making
+  Layer A's denial a correctness guard as well as a permission check. The restricted
+  Layer B example intentionally retains that independent denial.
 CI job 2 runs the integration suite against a Redis provisioned with a restricted ACL
 user and asserts that an EVAL smuggled past a hypothetically-broken Layer A still fails
 at Redis with a NOPERM error.
 
 ### Phase 5 acceptance
 - read_only: GET ok; SET/SCAN/KEYS → 403.
-- HELLO → 403 for EVERY identity including admin.
+- HELLO → 403 for EVERY identity including admin. This is load-bearing: if a deployment
+  broadens Layer B, Layer A is the remaining guard against pooled RESP-version corruption.
 - **Admin surface:** is_admin identity: CONFIG GET → 200, CONFIG SET → 403,
   MODULE LOAD → 403, MIGRATE → 403, SLAVEOF → 403, CLIENT LIST → 200,
   CLIENT KILL → 403 (subcommand-aware allow).
@@ -1093,14 +1104,16 @@ must not fall through to a same-value static credential.
   extractor fails and /ready silently 404s for everyone, including systemd. Performs
   a real `PING` on each
   configured pool that has been built via `ExecutorProvider::readiness()` (the
-  method exists for this endpoint alone and does NOT force-build pools); 200
+  method exists for this endpoint alone and does NOT force-build pools). Checks run
+  concurrently with an independent deadline of at most 500 ms per pool; 200
   `{"status":"ready","pools":{...}}` or 503 with per-pool status. For systemd/LB checks.
 - **Metrics — NOT feature-gated, always compiled**: Prometheus on `metrics_bind`
   (loopback default): request count by endpoint+status, latency histogram, per-pool
   active connections gauge, pool builds/evictions, auth failures by kind, rate-limit
   rejections — plus saturation observability: global in-flight gauge, per-pool
   permits-in-use and waiter-depth gauges, shed counter by cause
-  (global_limit | pool_queue_full | acquire_timeout | breaker_open | response_too_large),
+  (global_limit | pool_queue_full | acquire_timeout | breaker_open | response_too_large |
+  debt_forgiven_by_eviction),
   breaker state gauge per pool (0=closed 1=half 2=open). The shed-by-cause counter is
   what tells you WHICH bound is the bottleneck when you're bending; without it,
   capacity tuning is guesswork. Metrics server itself never routes through the
@@ -1289,7 +1302,8 @@ restart when load subsides.
 - No `unwrap()`/`expect()` outside tests and startup validation.
 - All handlers return `Result<_, AppError>`.
 - `#![forbid(unsafe_code)]`; clippy clean with `-D warnings`.
-- Doc comments + unit tests for every public fn in convert.rs, acl.rs, auth/*.
+- Doc comments + unit tests for every public fn in `convert.rs`, `acl.rs`, and
+  `adapters/*_auth.rs`.
 - Never log tokens, JWTs, connection strings, command arguments, or Upstash-Telemetry
   headers.
 - Verify all dependency API names against docs.rs for locked versions before use.
@@ -1301,6 +1315,6 @@ restart when load subsides.
 - Reject before you buffer: every limit check happens at the cheapest possible point
   (before body read where feasible, before Redis work always).
 - **Architecture rules (§0.5) are normative:** dependency rule enforced by CI grep;
-  exactly the five listed ports; decorators over modification for cross-cutting
+  exactly the six listed ports; decorators over modification for cross-cutting
   executor behavior; business rules live in `domain/` only; fakes must pass the same
   contract suites as real adapters.

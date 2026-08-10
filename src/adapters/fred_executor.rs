@@ -4,9 +4,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use fred::clients::Client;
 use fred::error::{Error, ErrorKind};
-use fred::interfaces::{ClientLike, TransactionInterface};
+use fred::interfaces::ClientLike;
 use fred::types::config::{Config, ConnectionConfig, PerformanceConfig, ReconnectPolicy};
-use fred::types::{ClusterHash, ConnectHandle, CustomCommand, Resp3Frame, RespVersion, Value};
+use fred::types::{ClusterHash, ConnectHandle, CustomCommand, Resp3Frame, RespVersion};
 use futures_util::future::join_all;
 
 use crate::domain::convert::MAX_DEPTH;
@@ -18,6 +18,7 @@ pub struct FredExecutor {
     connection_task: Option<ConnectHandle>,
     reset_timeout: Duration,
     reset_started: AtomicBool,
+    operation_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl FredExecutor {
@@ -53,16 +54,22 @@ impl FredExecutor {
             connection_task: Some(connection_task),
             reset_timeout: command_timeout,
             reset_started: AtomicBool::new(false),
+            operation_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
     /// Wraps a client whose connection task is owned by a long-lived pool.
-    pub fn from_pooled_client(client: Client, reset_timeout: Duration) -> Self {
+    pub fn from_pooled_client(
+        client: Client,
+        reset_timeout: Duration,
+        operation_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    ) -> Self {
         Self {
             client,
             connection_task: None,
             reset_timeout,
             reset_started: AtomicBool::new(false),
+            operation_lock,
         }
     }
 
@@ -73,12 +80,8 @@ impl FredExecutor {
         )
     }
 
-    async fn map_error(&self, error: Error, response_stage: bool) -> ExecError {
-        let mapped = if response_stage {
-            map_fred_response_error(error)
-        } else {
-            map_fred_error(error)
-        };
+    async fn map_error(&self, error: Error) -> ExecError {
+        let mapped = map_fred_error(error);
         // A timeout on a connected client can leave an unread response. A
         // disconnected client is already in Fred's reconnect loop; sending a
         // second reconnect command there can delay recovery.
@@ -98,6 +101,22 @@ impl FredExecutor {
         }
         mapped
     }
+
+    async fn raw(
+        &self,
+        command: CustomCommand,
+        args: Vec<bytes::Bytes>,
+    ) -> Result<Resp3Frame, ExecError> {
+        match self.client.custom_raw(command, args).await {
+            Ok(frame) => Ok(frame),
+            Err(error) => Err(self.map_error(error).await),
+        }
+    }
+
+    async fn execute_unlocked(&self, command: RedisCommand) -> Result<RespValue, ExecError> {
+        let (command, args) = Self::command(command);
+        fred_frame_to_resp(self.raw(command, args).await?)
+    }
 }
 
 impl Drop for FredExecutor {
@@ -111,75 +130,72 @@ impl Drop for FredExecutor {
 #[async_trait]
 impl CommandExecutor for FredExecutor {
     async fn execute(&self, command: RedisCommand) -> Result<RespValue, ExecError> {
-        let (command, args) = Self::command(command);
-        let frame = match self.client.custom_raw(command, args).await {
-            Ok(frame) => frame,
-            Err(error) => return Err(self.map_error(error, false).await),
-        };
-        fred_frame_to_resp(frame)
+        let _guard = self.operation_lock.lock().await;
+        self.execute_unlocked(command).await
     }
 
     async fn pipeline(&self, commands: Vec<RedisCommand>) -> Vec<Result<RespValue, ExecError>> {
+        let _guard = self.operation_lock.lock().await;
         // Poll in request order on one task. Fred enqueues each command on its
         // first poll; spawning per command can reorder dependent commands.
-        join_all(commands.into_iter().map(|command| self.execute(command))).await
+        join_all(
+            commands
+                .into_iter()
+                .map(|command| self.execute_unlocked(command)),
+        )
+        .await
     }
 
-    async fn transaction(&self, commands: Vec<RedisCommand>) -> Result<Vec<RespValue>, ExecError> {
+    async fn transaction(
+        &self,
+        commands: Vec<RedisCommand>,
+    ) -> Result<Vec<Result<RespValue, ExecError>>, ExecError> {
         if commands.is_empty() {
             return Ok(Vec::new());
         }
-        let transaction = self.client.multi();
+        let _guard = self.operation_lock.lock().await;
+        let slot = commands
+            .iter()
+            .find_map(|command| command.args.first())
+            .map(|key| fred::util::redis_keyslot(key));
+        let hash = slot.map_or(ClusterHash::FirstKey, ClusterHash::Custom);
+        let control = |name| CustomCommand::new(name, hash.clone(), false);
+
+        match fred_frame_to_resp(self.raw(control("MULTI"), Vec::new()).await?)? {
+            RespValue::Simple(response) if response == "OK" => {}
+            response => return Err(protocol_violation(&format!("MULTI returned {response:?}"))),
+        }
         for command in commands {
-            let (command, args) = Self::command(command);
-            if let Err(error) = transaction.custom::<Value, _>(command, args).await {
-                return Err(self.map_error(error, false).await);
+            let command_name = command.name;
+            let args = command.args;
+            let command = CustomCommand::new(command_name, hash.clone(), false);
+            match self.raw(command, args).await.and_then(fred_frame_to_resp) {
+                Ok(RespValue::Simple(response)) if response == "QUEUED" => {}
+                Ok(response) => {
+                    let _ = self.raw(control("DISCARD"), Vec::new()).await;
+                    return Err(protocol_violation(&format!(
+                        "transaction command returned {response:?} instead of QUEUED"
+                    )));
+                }
+                Err(error) => {
+                    let _ = self.raw(control("DISCARD"), Vec::new()).await;
+                    return Err(error);
+                }
             }
         }
-        let value: Value = match transaction.exec(true).await {
-            Ok(value) => value,
-            Err(error) => return Err(self.map_error(error, true).await),
-        };
-        match fred_value_to_resp(value)? {
-            RespValue::Array(values) => Ok(values),
-            RespValue::Nil => Err(ExecError::Redis(
+        match self.raw(control("EXEC"), Vec::new()).await? {
+            Resp3Frame::Array { data, .. } => Ok(data
+                .into_iter()
+                .map(|frame| frame_within_depth(frame, MAX_DEPTH))
+                .collect()),
+            Resp3Frame::Null => Err(ExecError::Redis(
                 "EXECABORT Transaction discarded because of previous errors.".to_owned(),
             )),
-            _ => Err(protocol_violation("EXEC returned a non-array response")),
+            frame => match fred_frame_to_resp(frame) {
+                Err(error) => Err(error),
+                Ok(_) => Err(protocol_violation("EXEC returned a non-array response")),
+            },
         }
-    }
-}
-
-fn fred_value_to_resp(value: Value) -> Result<RespValue, ExecError> {
-    value_within_depth(value, MAX_DEPTH)
-}
-
-fn value_within_depth(value: Value, depth_remaining: usize) -> Result<RespValue, ExecError> {
-    let depth_remaining = depth_remaining
-        .checked_sub(1)
-        .ok_or(ExecError::ResponseTooLarge)?;
-    match value {
-        // Fred's public transaction API collapses simple and valid UTF-8 bulk
-        // strings into Value::String before returning. See the documented
-        // multi-exec/base64 `OK` divergence in §1.7.
-        Value::String(value) if value.as_bytes() == b"OK" => {
-            Ok(RespValue::Simple(value.to_string()))
-        }
-        Value::String(value) => Ok(RespValue::Bulk(bytes::Bytes::copy_from_slice(
-            value.as_bytes(),
-        ))),
-        Value::Bytes(value) => Ok(RespValue::Bulk(value)),
-        Value::Integer(value) => Ok(RespValue::Int(value)),
-        Value::Null => Ok(RespValue::Nil),
-        Value::Array(values) => values
-            .into_iter()
-            .map(|value| value_within_depth(value, depth_remaining))
-            .collect::<Result<Vec<_>, _>>()
-            .map(RespValue::Array),
-        Value::Boolean(_) => Err(protocol_violation("unexpected RESP3 boolean")),
-        Value::Double(_) => Err(protocol_violation("unexpected RESP3 double")),
-        Value::Map(_) => Err(protocol_violation("unexpected RESP3 map")),
-        Value::Queued => Err(protocol_violation("unexpected queued response")),
     }
 }
 
@@ -233,14 +249,6 @@ fn map_fred_error(error: Error) -> ExecError {
     }
 }
 
-fn map_fred_response_error(error: Error) -> ExecError {
-    if error.kind() == &ErrorKind::Unknown {
-        ExecError::Redis(error.details().to_owned())
-    } else {
-        map_fred_error(error)
-    }
-}
-
 fn is_redis_error(details: &str) -> bool {
     details.split_whitespace().next().is_some_and(|prefix| {
         !prefix.is_empty()
@@ -261,24 +269,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maps_all_resp2_fred_values() {
-        assert_eq!(
-            fred_value_to_resp(Value::String("OK".into())),
-            Ok(RespValue::Simple("OK".to_owned()))
-        );
-        assert_eq!(
-            fred_value_to_resp(Value::Bytes(Bytes::from_static(b"raw"))),
-            Ok(RespValue::Bulk(Bytes::from_static(b"raw")))
-        );
-        assert_eq!(fred_value_to_resp(Value::Integer(2)), Ok(RespValue::Int(2)));
-        assert_eq!(fred_value_to_resp(Value::Null), Ok(RespValue::Nil));
-        assert_eq!(
-            fred_value_to_resp(Value::Array(vec![Value::Integer(1), Value::Null])),
-            Ok(RespValue::Array(vec![RespValue::Int(1), RespValue::Nil]))
-        );
-    }
-
-    #[test]
     fn raw_frames_preserve_simple_and_bulk_string_kinds() {
         assert_eq!(
             fred_frame_to_resp(Resp3Frame::SimpleString {
@@ -297,16 +287,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_resp3_only_fred_values() {
-        for value in [Value::Boolean(true), Value::Double(1.5), Value::Queued] {
-            assert!(matches!(
-                fred_value_to_resp(value),
-                Err(ExecError::Transport(message)) if message.contains("protocol violation")
-            ));
-        }
-    }
-
-    #[test]
     fn preserves_raw_redis_errors_and_classifies_client_errors() {
         let redis = Error::new(
             ErrorKind::InvalidArgument,
@@ -322,14 +302,6 @@ mod tests {
         );
         assert!(matches!(
             map_fred_error(Error::new(ErrorKind::IO, "connection reset")),
-            ExecError::Transport(_)
-        ));
-        assert_eq!(
-            map_fred_response_error(Error::new(ErrorKind::Unknown, "boom lowercase failure")),
-            ExecError::Redis("boom lowercase failure".to_owned())
-        );
-        assert!(matches!(
-            map_fred_response_error(Error::new(ErrorKind::IO, "connection reset")),
             ExecError::Transport(_)
         ));
     }

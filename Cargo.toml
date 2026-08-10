@@ -1,6 +1,6 @@
 [package]
 name = "srh-rs"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.97"
 
@@ -21,7 +21,7 @@ hyper = { version = "1", features = ["http1", "server"] }
 http-body-util = "0.1"
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "server-graceful", "service", "tokio"] }
-jsonwebtoken = "10"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 serde = { version = "1", features = ["derive"] }

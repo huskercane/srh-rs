@@ -328,6 +328,13 @@ fn mutations(root: &Path) -> Vec<Mutation> {
         Expectation::Killed,
     ));
     all.push(mutation(
+        "multi-exec-runtime-error-result-dropped",
+        MULTI_EXEC,
+        "            Err(ExecError::Redis(message)) => Ok(json!({ \"error\": message })),",
+        "            Err(ExecError::Redis(message)) => Ok(json!({ \"result\": message })),",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
         "pipeline-sends-denied",
         PIPELINE,
         "            Err(crate::domain::acl::AclError::Forbidden(message)) => {\n                slots.push(Some(json!({ \"error\": message })));\n            }",

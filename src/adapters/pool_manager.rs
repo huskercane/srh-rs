@@ -21,6 +21,7 @@ use crate::domain::resp::{AcquireError, PoolReadiness, PoolReadinessStatus, Resp
 use crate::ports::{Clock, CommandExecutor, ExecutorHandle, ExecutorProvider, RedisCommand};
 
 const IDLE_EVICTION_SECS: u64 = 900;
+const READINESS_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub struct PoolManager {
     pools: DashMap<String, Arc<PoolEntry>>,
@@ -30,6 +31,9 @@ pub struct PoolManager {
 
 struct PoolEntry {
     pool: Pool,
+    client_leases: Vec<Arc<tokio::sync::Mutex<()>>>,
+    client_operations: Vec<Arc<tokio::sync::Mutex<()>>>,
+    next_client: AtomicUsize,
     connection_tasks: Mutex<Vec<ConnectHandle>>,
     last_used: AtomicU64,
     permits: Arc<tokio::sync::Semaphore>,
@@ -109,6 +113,13 @@ impl PoolManager {
             "Redis pool built"
         );
         Ok(PoolEntry {
+            client_leases: (0..pool_config.max_connections)
+                .map(|_| Arc::new(tokio::sync::Mutex::new(())))
+                .collect(),
+            client_operations: (0..pool_config.max_connections)
+                .map(|_| Arc::new(tokio::sync::Mutex::new(())))
+                .collect(),
+            next_client: AtomicUsize::new(0),
             pool,
             connection_tasks: Mutex::new(vec![connection_task]),
             last_used: AtomicU64::new(self.clock.unix_secs()),
@@ -181,9 +192,12 @@ impl PoolManager {
         metrics::gauge!("srh_pool_active_connections", "pool" => name.to_owned())
             .set(entry.pool.active_connections().len() as f64);
 
+        let (client, client_lease, operation_lock) = entry.acquire_client().await;
+
         let executor: Arc<dyn CommandExecutor> = Arc::new(FredExecutor::from_pooled_client(
-            entry.pool.next_connected().clone(),
+            client,
             entry.command_timeout,
+            operation_lock,
         ));
         let executor: Arc<dyn CommandExecutor> = Arc::new(BreakerExecutor::new(
             executor,
@@ -196,6 +210,7 @@ impl PoolManager {
             executor,
             Box::new(PoolLease {
                 _permit: permit,
+                _client_lease: client_lease,
                 pool: name.to_owned(),
             }),
         ))
@@ -248,30 +263,42 @@ impl ExecutorProvider for PoolManager {
             .iter()
             .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
             .collect();
-        let mut readiness = Vec::with_capacity(entries.len());
-        for (name, entry) in entries {
-            // Readiness measures backend health, not request admission. It must
-            // not compete for permits or consume a half-open traffic probe.
-            let executor = FredExecutor::from_pooled_client(
-                entry.pool.next_connected().clone(),
-                entry.command_timeout,
-            );
-            let status = match executor
-                .execute(RedisCommand {
-                    name: "PING".to_owned(),
-                    args: Vec::new(),
-                })
-                .await
-            {
-                Ok(RespValue::Simple(response)) if response == "PONG" => PoolReadinessStatus::Ready,
-                Ok(response) => PoolReadinessStatus::Unavailable(format!(
+        futures_util::future::join_all(entries.into_iter().map(|(name, entry)| async move {
+            // Readiness bypasses request permits and breaker admission, but uses
+            // a short independent deadline so a hung backend cannot delay the
+            // endpoint by one command timeout per built pool.
+            let deadline = READINESS_TIMEOUT.min(entry.command_timeout);
+            let check = async move {
+                let (client, operation_lock) = entry.readiness_client();
+                FredExecutor::from_pooled_client(client, entry.command_timeout, operation_lock)
+                    .execute(RedisCommand {
+                        name: "PING".to_owned(),
+                        args: Vec::new(),
+                    })
+                    .await
+            };
+            // Detach an over-deadline probe instead of cancelling it. Once a
+            // command has entered Fred, dropping its future can leave a reply
+            // unread; the detached task completes the normal timeout/reset path.
+            let status = match tokio::time::timeout(deadline, tokio::spawn(check)).await {
+                Ok(Ok(Ok(RespValue::Simple(response)))) if response == "PONG" => {
+                    PoolReadinessStatus::Ready
+                }
+                Ok(Ok(Ok(response))) => PoolReadinessStatus::Unavailable(format!(
                     "unexpected readiness PING response: {response:?}"
                 )),
-                Err(error) => PoolReadinessStatus::Unavailable(error.to_string()),
+                Ok(Ok(Err(error))) => PoolReadinessStatus::Unavailable(error.to_string()),
+                Ok(Err(error)) => PoolReadinessStatus::Unavailable(format!(
+                    "readiness probe task failed: {error}"
+                )),
+                Err(_) => PoolReadinessStatus::Unavailable(format!(
+                    "readiness PING timed out after {} ms",
+                    deadline.as_millis()
+                )),
             };
-            readiness.push(PoolReadiness { pool: name, status });
-        }
-        readiness
+            PoolReadiness { pool: name, status }
+        }))
+        .await
     }
 }
 
@@ -290,6 +317,7 @@ impl Drop for WaiterGuard {
 
 struct PoolLease {
     _permit: tokio::sync::OwnedSemaphorePermit,
+    _client_lease: tokio::sync::OwnedMutexGuard<()>,
     pool: String,
 }
 
@@ -313,6 +341,46 @@ impl Drop for AdmissionGuard {
 }
 
 impl PoolEntry {
+    async fn acquire_client(
+        &self,
+    ) -> (
+        fred::clients::Client,
+        tokio::sync::OwnedMutexGuard<()>,
+        Arc<tokio::sync::Mutex<()>>,
+    ) {
+        let size = self.client_leases.len();
+        let start = self.next_client.fetch_add(1, Ordering::Relaxed) % size;
+        for offset in 0..size {
+            let index = (start + offset) % size;
+            if let Ok(lease) = Arc::clone(&self.client_leases[index]).try_lock_owned() {
+                return (
+                    self.pool.clients()[index].clone(),
+                    lease,
+                    Arc::clone(&self.client_operations[index]),
+                );
+            }
+        }
+        let lease = Arc::clone(&self.client_leases[start]).lock_owned().await;
+        (
+            self.pool.clients()[start].clone(),
+            lease,
+            Arc::clone(&self.client_operations[start]),
+        )
+    }
+
+    fn readiness_client(&self) -> (fred::clients::Client, Arc<tokio::sync::Mutex<()>>) {
+        let size = self.client_operations.len();
+        let start = self.next_client.fetch_add(1, Ordering::Relaxed) % size;
+        let index = (0..size)
+            .map(|offset| (start + offset) % size)
+            .find(|index| self.client_operations[*index].try_lock().is_ok())
+            .unwrap_or(start);
+        (
+            self.pool.clients()[index].clone(),
+            Arc::clone(&self.client_operations[index]),
+        )
+    }
+
     fn ensure_connection_task(&self) {
         let mut tasks = self
             .connection_tasks

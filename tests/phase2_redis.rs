@@ -168,8 +168,8 @@ async fn fred_executor_satisfies_contract_and_preserves_binary_values() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response_json(response).await,
-        serde_json::json!([{ "result": "OK" }]),
-        "documented Fred divergence: transaction Value loses bulk framing"
+        serde_json::json!([{ "result": "T0s=" }]),
+        "raw EXEC frames must preserve bulk framing in base64 mode"
     );
 
     executor
@@ -189,10 +189,14 @@ async fn fred_executor_satisfies_contract_and_preserves_binary_values() {
         )
         .await
         .expect("multi-exec runtime-error request should complete");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response_json(response).await,
-        serde_json::json!({ "error": "ERR value is not an integer or out of range" })
+        serde_json::json!([
+            { "result": "OK" },
+            { "error": "ERR value is not an integer or out of range" },
+            { "result": "OK" }
+        ])
     );
     assert_eq!(
         executor
@@ -503,7 +507,7 @@ async fn transactions_remain_isolated_from_concurrent_commands(executor: Arc<dyn
         let (index, result, expected) = transaction.expect("transaction task should complete");
         assert_eq!(
             result,
-            Ok(expected),
+            Ok(expected.into_iter().map(Ok).collect()),
             "transaction {index} received another command's reply"
         );
     }

@@ -30,7 +30,10 @@ impl CommandExecutor for FixedExecutor {
         unreachable!("pipeline remains a Phase 3 route")
     }
 
-    async fn transaction(&self, _commands: Vec<RedisCommand>) -> Result<Vec<RespValue>, ExecError> {
+    async fn transaction(
+        &self,
+        _commands: Vec<RedisCommand>,
+    ) -> Result<Vec<Result<RespValue, ExecError>>, ExecError> {
         unreachable!("transactions remain a Phase 3 route")
     }
 }

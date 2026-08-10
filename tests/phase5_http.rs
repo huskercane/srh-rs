@@ -45,10 +45,13 @@ impl CommandExecutor for RecordingExecutor {
         vec![Ok(RespValue::Simple("OK".to_owned())); count]
     }
 
-    async fn transaction(&self, commands: Vec<RedisCommand>) -> Result<Vec<RespValue>, ExecError> {
+    async fn transaction(
+        &self,
+        commands: Vec<RedisCommand>,
+    ) -> Result<Vec<Result<RespValue, ExecError>>, ExecError> {
         let count = commands.len();
         self.record(commands);
-        Ok(vec![RespValue::Simple("OK".to_owned()); count])
+        Ok(vec![Ok(RespValue::Simple("OK".to_owned())); count])
     }
 }
 

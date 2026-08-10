@@ -58,8 +58,32 @@ pub async fn executor_contract(executor: Arc<dyn CommandExecutor>) {
                 command("INCR", &["srh:contract:second"]),
             ])
             .await,
-        Ok(vec![RespValue::Int(1), RespValue::Int(1)]),
-        "transaction results must remain ordered and all-or-error"
+        Ok(vec![Ok(RespValue::Int(1)), Ok(RespValue::Int(1))]),
+        "transaction results must remain ordered"
+    );
+
+    assert_eq!(
+        executor
+            .execute(command("SET", &["srh:contract:transaction-error", "text"]))
+            .await,
+        Ok(RespValue::Simple("OK".to_owned()))
+    );
+    assert_eq!(
+        executor
+            .transaction(vec![
+                command("SET", &["srh:contract:transaction-before", "written"]),
+                command("INCR", &["srh:contract:transaction-error"]),
+                command("SET", &["srh:contract:transaction-after", "written"]),
+            ])
+            .await,
+        Ok(vec![
+            Ok(RespValue::Simple("OK".to_owned())),
+            Err(ExecError::Redis(
+                "ERR value is not an integer or out of range".to_owned()
+            )),
+            Ok(RespValue::Simple("OK".to_owned())),
+        ]),
+        "EXEC-time errors must remain in their slot without hiding committed results"
     );
 
     let transaction_error = executor
@@ -138,6 +162,12 @@ mod tests {
             Ok(RespValue::Nil),
             Ok(RespValue::Int(1)),
             Ok(RespValue::Int(1)),
+            Ok(RespValue::Simple("OK".to_owned())),
+            Ok(RespValue::Simple("OK".to_owned())),
+            Err(ExecError::Redis(
+                "ERR value is not an integer or out of range".to_owned(),
+            )),
+            Ok(RespValue::Simple("OK".to_owned())),
             Err(ExecError::Redis(
                 "ERR unknown command 'SRH_UNKNOWN_COMMAND'".to_owned(),
             )),

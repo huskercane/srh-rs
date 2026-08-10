@@ -50,8 +50,11 @@ impl CommandExecutor for Executor {
         vec![Ok(RespValue::Simple("OK".to_owned())); commands.len()]
     }
 
-    async fn transaction(&self, commands: Vec<RedisCommand>) -> Result<Vec<RespValue>, ExecError> {
-        Ok(vec![RespValue::Simple("OK".to_owned()); commands.len()])
+    async fn transaction(
+        &self,
+        commands: Vec<RedisCommand>,
+    ) -> Result<Vec<Result<RespValue, ExecError>>, ExecError> {
+        Ok(vec![Ok(RespValue::Simple("OK".to_owned())); commands.len()])
     }
 }
 

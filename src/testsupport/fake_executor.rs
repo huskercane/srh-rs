@@ -59,9 +59,21 @@ impl CommandExecutor for FakeExecutor {
         (0..count).map(|_| self.next()).collect()
     }
 
-    async fn transaction(&self, commands: Vec<RedisCommand>) -> Result<Vec<RespValue>, ExecError> {
+    async fn transaction(
+        &self,
+        commands: Vec<RedisCommand>,
+    ) -> Result<Vec<Result<RespValue, ExecError>>, ExecError> {
         let count = commands.len();
         self.record(commands);
-        (0..count).map(|_| self.next()).collect()
+        let mut slots = Vec::with_capacity(count);
+        for _ in 0..count {
+            let slot = self.next();
+            if matches!(&slot, Err(ExecError::Redis(message)) if message.starts_with("ERR unknown command"))
+            {
+                return slot.map(|value| vec![Ok(value)]);
+            }
+            slots.push(slot);
+        }
+        Ok(slots)
     }
 }

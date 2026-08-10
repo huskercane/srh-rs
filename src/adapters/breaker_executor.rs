@@ -63,9 +63,15 @@ impl CommandExecutor for BreakerExecutor {
         results
     }
 
-    async fn transaction(&self, commands: Vec<RedisCommand>) -> Result<Vec<RespValue>, ExecError> {
+    async fn transaction(
+        &self,
+        commands: Vec<RedisCommand>,
+    ) -> Result<Vec<Result<RespValue, ExecError>>, ExecError> {
         let result = self.inner.transaction(commands).await;
-        self.record(result.as_ref().err());
+        match &result {
+            Ok(slots) => self.record(slots.iter().filter_map(|slot| slot.as_ref().err())),
+            Err(error) => self.record(Some(error)),
+        }
         result
     }
 }

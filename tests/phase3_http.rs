@@ -59,10 +59,13 @@ impl CommandExecutor for ScriptedExecutor {
         (0..count).map(|_| self.next()).collect()
     }
 
-    async fn transaction(&self, commands: Vec<RedisCommand>) -> Result<Vec<RespValue>, ExecError> {
+    async fn transaction(
+        &self,
+        commands: Vec<RedisCommand>,
+    ) -> Result<Vec<Result<RespValue, ExecError>>, ExecError> {
         let count = commands.len();
         self.record(commands);
-        (0..count).map(|_| self.next()).collect()
+        Ok((0..count).map(|_| self.next()).collect())
     }
 }
 
@@ -231,6 +234,36 @@ async fn multi_exec_maps_every_exec_result() {
     assert_eq!(
         response_json(response).await,
         json!([{ "result": "OK" }, { "result": "value" }])
+    );
+    assert_eq!(provider.acquires.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn multi_exec_maps_exec_time_errors_without_dropping_other_slots() {
+    let (app, provider) = app(
+        [
+            Ok(RespValue::Simple("OK".to_owned())),
+            Err(ExecError::Redis("ERR runtime failure".to_owned())),
+            Ok(RespValue::Int(1)),
+        ],
+        json!({}),
+    );
+    let response = app
+        .oneshot(post(
+            "/multi-exec",
+            r#"[["SET","key","value"],["INCR","bad"],["INCR","counter"]]"#,
+        ))
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await,
+        json!([
+            { "result": "OK" },
+            { "error": "ERR runtime failure" },
+            { "result": 1 }
+        ])
     );
     assert_eq!(provider.acquires.load(Ordering::Relaxed), 1);
 }

@@ -11,7 +11,7 @@ allowlisting, per-identity rate limiting, bounded pool queues, and circuit break
 
 Wire compatibility with the `@upstash/redis` SDK is the top-level design requirement.
 
-> ### Status: production-ready initial delivery
+> ### Status: ready for the target deployment
 >
 > Phases 0–7 and 9 are implemented: the architecture scaffold, configuration, static-token and JWT
 > authentication, admission controls, RESP conversion, and all three Redis execution routes are
@@ -38,6 +38,10 @@ Wire compatibility with the `@upstash/redis` SDK is the top-level design require
 >
 > Sections for later phases describe the target contract; the status table identifies what is
 > currently implemented.
+>
+> Compatibility note: the upstream SDK gate is pinned to a commit dated 2023-10-19 while
+> its runner is migrated from Deno to Bun; see [issue #3](https://github.com/huskercane/srh-rs/issues/3)
+> and [Development](#development).
 
 ---
 
@@ -74,7 +78,7 @@ docker run -d -p 8079:80 --name srh \
   -e SRH_MODE=env \
   -e SRH_TOKEN=your_token_here \
   -e SRH_CONNECTION_STRING="redis://your_server:6379" \
-  ghcr.io/huskercane/srh-rs:v1.0.0
+  ghcr.io/huskercane/srh-rs:v1.0.1
 ```
 
 Then point the SDK at it:
@@ -115,7 +119,7 @@ For Docker, attach Redis and the proxy to a private Docker network, use the Redi
 `connection_string` (not `localhost`), and mount the configuration read-only:
 
 ```bash
-VERSION=1.0.0
+VERSION=1.0.1
 sudo chown root:65532 tokens.json
 sudo chmod 0640 tokens.json
 docker network create srh-backend
@@ -237,17 +241,17 @@ response could not be rendered. Treat it the way you would treat a timeout after
 fails the whole request on every endpoint, including `/pipeline`, which otherwise always
 returns 200.
 
-### Deliberate differences from Upstash
+### Known differences from Upstash
 
-These are intentional and will not be "fixed":
+These are the known Upstash-vs-Redis protocol differences:
 
 - `UNLINK` with zero keys returns the real Redis error rather than a synthesized success.
 - `ZRANGE` requires `BYSCORE` or `BYLEX` in order to use `LIMIT`.
 - RedisJSON responses may differ subtly.
-- In base64 mode, a bulk value containing exactly `OK` inside `/multi-exec` is returned as
-  `"OK"`, not `"T0s="`. Fred's public transaction API does not preserve simple-vs-bulk framing.
-- Redis transactions do not roll back commands after an EXEC-time command error. The endpoint
-  returns 400 with that error and omits successful slot results, but other commands may commit.
+
+Direct `MULTI`, `EXEC`, `DISCARD`, `WATCH`, and `UNWATCH` are denied, matching the stateless
+Upstash REST surface. Use `/multi-exec`; EXEC-time command errors appear in their individual
+`{"error": ...}` slots while the endpoint returns 200 and preserves every other result.
 
 ---
 
@@ -414,7 +418,7 @@ nominally set much lower.
 
 The bucket holds `2 × rate` and **may go negative**. A request is admitted whenever the
 balance is positive beforehand; the full charge is then applied, possibly leaving a deficit,
-and the token is throttled until refill clears it. Rejected requests are not charged. This
+and the token is throttled until refill clears it. Rate-limit rejections are not charged. This
 matters because a classic bucket can never admit a request costing more than its capacity —
 with a rate of 10, every pipeline over 20 commands would be a permanent 429, and the SDK
 batches automatically, so that would fire in normal use rather than under attack.
@@ -465,6 +469,10 @@ Two traps worth knowing before you copy that:
 - **`+multi +exec +discard` are also for the proxy.** Direct transaction-state commands stay
   denied to HTTP clients because they would contaminate pooled connections, but `/multi-exec`
   uses these commands internally to execute one bounded transaction.
+- **Do not add `+hello` to this user.** `HELLO` changes protocol state on a pooled connection,
+  so its Layer A denial is a correctness boundary, not merely a permission check. Keeping it
+  absent from Layer B preserves defense in depth; the `HELLO`-is-always-403 regression test is
+  load-bearing if a deployment grants it for some external handshake requirement.
 
 ### Command policy
 
@@ -607,15 +615,17 @@ credential.
 Health and readiness sit outside the admission-control stack on purpose. An overloaded proxy
 that cannot answer its health check gets restarted by the orchestrator mid-recovery, which is
 worse than the overload. Readiness PINGs bypass pool request permits and breaker admission:
-a saturated but reachable Redis remains ready, and health checks cannot consume a half-open
-traffic probe.
+health checks cannot consume a half-open traffic probe. Built pools are probed concurrently,
+each with its own deadline of at most 500 ms; a pool that cannot answer in time is not ready.
+`/health` is intentionally also outside `max_in_flight`, so liveness traffic is unbounded inside
+the process; deployments should retain the documented reverse-proxy rate limit for public binds.
 
 Metrics cover request counts and latency by endpoint and status, per-pool connection gauges,
 pool builds and evictions, auth failures by kind, rate-limit rejections, and saturation
 signals: global in-flight, per-pool permits-in-use and waiter depth, circuit-breaker state,
 and a shed counter broken down by cause (`global_limit`, `pool_queue_full`, `acquire_timeout`,
-`breaker_open`, `response_too_large`). That last one is what tells you which bound you are
-actually hitting; without it, capacity tuning is guesswork.
+`breaker_open`, `response_too_large`, `debt_forgiven_by_eviction`). That last one is what tells
+you which bound you are actually hitting; without it, capacity tuning is guesswork.
 
 One audit line per request records subject, pool, command name, status, latency, and pipeline
 length. Command *arguments* are never logged, nor are tokens, JWTs, connection strings, or
@@ -629,7 +639,7 @@ stripped static `x86_64-unknown-linux-musl` binary archive, its SHA-256 checksum
 the hardened systemd unit and example config. For example:
 
 ```bash
-VERSION=1.0.0
+VERSION=1.0.1
 gh release download "v$VERSION" --repo huskercane/srh-rs \
   --pattern 'srh-rs-*.tar.gz' --pattern 'srh-rs-*.tar.gz.sha256'
 sha256sum --check "srh-rs-v$VERSION-x86_64-unknown-linux-musl.tar.gz.sha256"
@@ -791,8 +801,9 @@ Mutation kills include both behavioral tests and a small set of explicit source-
 for the composition root and workflow files; those wiring kills are not behavioral coverage.
 
 CI also runs the pinned, last Deno-compatible upstream Upstash suite at commit
-`1298187065cb802720b876ff9efcf2e9d7d408ef` against Redis Stack and the built image. The current
-upstream suite uses Bun, so moving that pin requires explicitly migrating the gate. Files under
+`1298187065cb802720b876ff9efcf2e9d7d408ef` (2023-10-19) against Redis Stack and the built
+image. The current upstream suite uses Bun, so moving that pin requires explicitly migrating
+the gate; [issue #3](https://github.com/huskercane/srh-rs/issues/3) tracks that work. Files under
 `ci/upstash-parity-policy-scope.txt` exercise commands the Phase 5 ACL intentionally denies and
 are outside protocol comparison; `ci/upstash-parity-skips.txt` contains only §1.7 protocol
 differences. The historical suite's dead `denopkg.com` import is remapped to the same tagged
