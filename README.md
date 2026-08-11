@@ -78,7 +78,7 @@ docker run -d -p 8079:80 --name srh \
   -e SRH_MODE=env \
   -e SRH_TOKEN=your_token_here \
   -e SRH_CONNECTION_STRING="redis://your_server:6379" \
-  ghcr.io/huskercane/srh-rs:v1.0.1
+  ghcr.io/huskercane/srh-rs:v1.0.4
 ```
 
 Then point the SDK at it:
@@ -119,7 +119,7 @@ For Docker, attach Redis and the proxy to a private Docker network, use the Redi
 `connection_string` (not `localhost`), and mount the configuration read-only:
 
 ```bash
-VERSION=1.0.1
+VERSION=1.0.4
 sudo chown root:65532 tokens.json
 sudo chmod 0640 tokens.json
 docker network create srh-backend
@@ -645,7 +645,7 @@ and the example config:
 | `x86_64-unknown-linux-musl` | fully static | The distroless image, and any host older than the glibc floor printed in the release job summary. |
 
 ```bash
-VERSION=1.0.1
+VERSION=1.0.4
 TARGET=x86_64-unknown-linux-gnu   # or -musl, per the table above
 gh release download "v$VERSION" --repo huskercane/srh-rs \
   --pattern 'srh-rs-*.tar.gz' --pattern 'srh-rs-*.tar.gz.sha256'
