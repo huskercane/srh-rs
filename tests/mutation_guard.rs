@@ -717,6 +717,20 @@ fn mutations(root: &Path) -> Vec<Mutation> {
         Expectation::Killed,
     ));
     all.push(mutation(
+        "healthy-probe-audited",
+        OBSERVABILITY,
+        "    if is_probe(endpoint) && (200..300).contains(&status) {\n        return;\n    }\n",
+        "",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "failing-probe-not-audited",
+        OBSERVABILITY,
+        "    if is_probe(endpoint) && (200..300).contains(&status) {",
+        "    if is_probe(endpoint) {",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
         "tcp-nodelay-disabled",
         MAIN,
         "stream.set_nodelay(true)",

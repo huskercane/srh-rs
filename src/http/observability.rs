@@ -216,6 +216,14 @@ fn record(started: Instant, endpoint: &'static str, audit: &AuditContext, respon
     metrics::histogram!("srh_http_request_duration_seconds", "endpoint" => endpoint, "status" => label)
         .record(elapsed.as_secs_f64());
 
+    // The audit event records who ran what. A succeeding health probe has neither: staging
+    // was emitting 8,640 of these a day, one every ten seconds, and they were 100% of this
+    // service's log volume — every line reading subject="-" command="-" status=200. The
+    // metrics above already carry the probe result, so only a failing probe earns a line.
+    if is_probe(endpoint) && (200..300).contains(&status) {
+        return;
+    }
+
     let fields = audit.lock();
     tracing::info!(
         subject = fields
@@ -258,6 +266,11 @@ fn status_label(status: u16) -> &'static str {
     }
 }
 
+/// Whether an endpoint is a liveness/readiness probe rather than a client request.
+fn is_probe(endpoint: &str) -> bool {
+    matches!(endpoint, "/health" | "/ready")
+}
+
 fn endpoint_label(path: &str) -> &'static str {
     match path {
         "/" => "/",
@@ -278,7 +291,7 @@ mod tests {
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
     use super::{
-        CommandLabel, Context, Layer, ObserveLayer, Poll, Request, Response, Service,
+        AuditContext, CommandLabel, Context, Layer, ObserveLayer, Poll, Request, Response, Service,
         endpoint_label, status_label,
     };
 
@@ -330,6 +343,68 @@ mod tests {
         assert_eq!(endpoint_label("/pipeline"), "/pipeline");
         assert_eq!(endpoint_label("/attacker-controlled/one"), "other");
         assert_eq!(endpoint_label("/attacker-controlled/two"), "other");
+    }
+
+    /// Counts emitted `tracing` events without pulling in a formatting subscriber.
+    struct CountEvents(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl tracing::Subscriber for CountEvents {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+            tracing::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn enter(&self, _: &tracing::Id) {}
+        fn exit(&self, _: &tracing::Id) {}
+    }
+
+    #[test]
+    fn a_healthy_probe_is_not_audited_but_a_failing_one_is() {
+        use std::sync::atomic::Ordering;
+
+        let events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tracing::subscriber::with_default(CountEvents(std::sync::Arc::clone(&events)), || {
+            let audit = AuditContext::default();
+
+            super::record(
+                std::time::Instant::now(),
+                "/health",
+                &audit,
+                &Response::new(Body::empty()),
+            );
+            assert_eq!(
+                events.load(Ordering::Relaxed),
+                0,
+                "a succeeding probe has no subject and no command; it must not be audited"
+            );
+
+            let mut failed = Response::new(Body::empty());
+            *failed.status_mut() = axum::http::StatusCode::SERVICE_UNAVAILABLE;
+            super::record(std::time::Instant::now(), "/ready", &audit, &failed);
+            assert_eq!(
+                events.load(Ordering::Relaxed),
+                1,
+                "a failing probe is the case worth keeping"
+            );
+
+            super::record(
+                std::time::Instant::now(),
+                "/",
+                &audit,
+                &Response::new(Body::empty()),
+            );
+            assert_eq!(
+                events.load(Ordering::Relaxed),
+                2,
+                "client requests are audited regardless of status"
+            );
+        });
     }
 
     #[test]
