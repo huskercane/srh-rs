@@ -11,7 +11,21 @@ fn runtime_and_scheduled_gates_keep_protections_wired() {
     assert!(main.contains("stream.set_nodelay(true)"));
 
     let router = source("src/http/mod.rs");
-    assert!(router.contains("TraceLayer::new_for_http().on_failure(())"));
+    // This gate exists to keep deliberate overload from becoming log amplification.
+    // `TraceLayer` used to carry it via `on_failure(())`, which disabled the callback that
+    // logs every shed 503 at ERROR. The layer has since been removed outright — at the
+    // production filter it emitted nothing at all, because `DefaultMakeSpan` and
+    // `DEFAULT_MESSAGE_LEVEL` are both DEBUG, while costing 11% of per-request CPU — so
+    // the hazard went with it. The protection now is that `ObserveLayer` is the only
+    // request logger, and it records a shed response at INFO like any other status.
+    assert!(router.contains(".layer(observability::ObserveLayer)"));
+    // Matches the constructor, not the bare name: the router carries a comment explaining
+    // why the layer is absent, and a gate that fires on its own rationale is a gate nobody
+    // can document.
+    assert!(
+        !router.contains("TraceLayer::new_for_http"),
+        "re-adding TraceLayer restores the shed-log amplification this gate exists to prevent"
+    );
 
     let workflow = source(".github/workflows/load.yml");
     assert!(workflow.contains("schedule:"));
