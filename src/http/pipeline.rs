@@ -2,13 +2,12 @@ use axum::Json;
 use axum::extract::{Extension, Request, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
-use serde_json::{Value, json};
 
 use crate::AppState;
-use crate::domain::convert::{json_args_to_redis, redis_value_to_json};
+use crate::domain::convert::charge_response_budget;
 use crate::domain::resp::ExecError;
 use crate::error::AppError;
-use crate::http::command::{charge_rate_limit, map_acquire_error, response_encoding};
+use crate::http::command::{Slot, charge_rate_limit, map_acquire_error, response_encoding};
 use crate::http::extractors::AuthedIdentity;
 
 pub async fn execute(
@@ -20,12 +19,12 @@ pub async fn execute(
 ) -> Result<Response, AppError> {
     audit.identity(&identity.0);
     let body = super::command::read_body(&state, request).await?;
-    let values = match super::parse::pipeline(
+    let commands = match super::parse::pipeline(
         &body,
         state.cfg.server.max_pipeline_commands,
         state.cfg.server.max_request_elements,
     ) {
-        Ok(values) => values,
+        Ok(commands) => commands,
         Err(error) => {
             charge_rate_limit(&state, &identity.0.bucket_key, 1)?;
             return Err(match error {
@@ -41,26 +40,25 @@ pub async fn execute(
             });
         }
     };
-    audit.command(Some("PIPELINE"), values.len());
-    charge_rate_limit(&state, &identity.0.bucket_key, values.len())?;
+    let command_count = commands.len();
+    audit.command(Some("PIPELINE"), command_count);
+    charge_rate_limit(&state, &identity.0.bucket_key, command_count)?;
     let mut allowed_commands = Vec::new();
-    let mut slots = Vec::with_capacity(values.len());
-    for command in &values {
-        match crate::domain::acl::check(&identity.0, command) {
+    let mut slots = Vec::with_capacity(command_count);
+    for command in commands {
+        match crate::domain::acl::check(&identity.0, &command) {
             Ok(()) => {
-                allowed_commands.push(crate::domain::compat::normalize(json_args_to_redis(
-                    command,
-                )?));
+                allowed_commands.push(crate::domain::compat::normalize(command));
                 slots.push(None);
             }
             Err(crate::domain::acl::AclError::Forbidden(message)) => {
-                slots.push(Some(json!({ "error": message })));
+                slots.push(Some(Slot::Error(message)));
             }
             Err(error) => return Err(error.into()),
         }
     }
-    if values.is_empty() {
-        return Ok(Json(Vec::<Value>::new()).into_response());
+    if command_count == 0 {
+        return Ok(Json(Vec::<Slot>::new()).into_response());
     }
     let results = if allowed_commands.is_empty() {
         Vec::new()
@@ -86,15 +84,17 @@ pub async fn execute(
         })?;
         let slot = match result {
             Ok(value) => {
-                let value = redis_value_to_json(value, encoding, &mut budget)?;
-                json!({ "result": value })
+                // Charged before the slot is built so the shared budget still fails the
+                // whole request, as it did when each value was converted eagerly.
+                charge_response_budget(&value, encoding, &mut budget)?;
+                Slot::Result { value, encoding }
             }
-            Err(ExecError::Redis(message)) => json!({ "error": message }),
+            Err(ExecError::Redis(message)) => Slot::Error(message),
             Err(ExecError::ResponseTooLarge) => return Err(AppError::ResponseTooLarge),
-            Err(ExecError::Timeout) => json!({ "error": "Redis command timed out" }),
+            Err(ExecError::Timeout) => Slot::Error("Redis command timed out".to_owned()),
             Err(ExecError::Transport(message)) => {
                 tracing::error!(error = %message, "pipeline command transport failure");
-                json!({ "error": "Internal server error" })
+                Slot::Error("Internal server error".to_owned())
             }
         };
         response.push(slot);

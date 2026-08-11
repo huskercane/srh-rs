@@ -1,10 +1,10 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
+use serde::ser::{Serialize, SerializeSeq, Serializer};
 use serde_json::Value;
 
 use crate::domain::resp::RespValue;
-use crate::ports::RedisCommand;
 
 const NODE_COST: usize = 8;
 
@@ -25,26 +25,13 @@ pub enum ConversionError {
     ResponseTooLarge,
 }
 
-/// Convert one JSON command array into raw Redis command bytes.
-pub fn json_args_to_redis(values: &[Value]) -> Result<RedisCommand, ConversionError> {
-    let Some(Value::String(name)) = values.first() else {
-        return Err(ConversionError::InvalidCommand);
-    };
-    if name.is_empty() {
-        return Err(ConversionError::InvalidCommand);
-    }
-
-    let args = values[1..]
-        .iter()
-        .map(json_value_to_bytes)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(RedisCommand {
-        name: name.clone(),
-        args,
-    })
-}
-
-fn json_value_to_bytes(value: &Value) -> Result<Bytes, ConversionError> {
+/// Converts one JSON command argument to raw Redis bytes.
+///
+/// This is the contract for argument encoding. `http::parse` produces the scalar cases
+/// directly from the deserializer without building a [`Value`] and calls this only for
+/// nested arrays and objects; `parse`'s `scalar_arguments_match_the_shared_conversion`
+/// test pins the two paths together.
+pub fn json_value_to_bytes(value: &Value) -> Result<Bytes, ConversionError> {
     let text = match value {
         Value::String(value) => return Ok(Bytes::copy_from_slice(value.as_bytes())),
         Value::Number(value) => value.to_string(),
@@ -57,21 +44,26 @@ fn json_value_to_bytes(value: &Value) -> Result<Bytes, ConversionError> {
     Ok(Bytes::from(text))
 }
 
-/// Convert a transport-independent RESP2 value to JSON within a shared budget.
-pub fn redis_value_to_json(
-    value: RespValue,
+/// Charges a RESP2 reply against the shared response budget and bounds its nesting.
+///
+/// This runs to completion *before* any of the reply is written, because exceeding the
+/// budget must fail the whole request with `ResponseTooLarge` (502) rather than truncate a
+/// response that has already been committed to. [`ResponseJson`] therefore serializes
+/// infallibly, and relies on this call having already refused anything too deep to recurse.
+pub fn charge_response_budget(
+    value: &RespValue,
     encoding: Encoding,
     budget: &mut usize,
-) -> Result<Value, ConversionError> {
-    convert_within_depth(value, encoding, budget, MAX_DEPTH)
+) -> Result<(), ConversionError> {
+    charge_within_depth(value, encoding, budget, MAX_DEPTH)
 }
 
-fn convert_within_depth(
-    value: RespValue,
+fn charge_within_depth(
+    value: &RespValue,
     encoding: Encoding,
     budget: &mut usize,
     depth_remaining: usize,
-) -> Result<Value, ConversionError> {
+) -> Result<(), ConversionError> {
     // The budget bounds total size but not nesting, and recursion here is stack
     // depth. A Lua script can return arbitrarily nested tables, so cap it —
     // `ResponseTooLarge` rather than a transport error because the backend is
@@ -83,32 +75,80 @@ fn convert_within_depth(
     match value {
         RespValue::Simple(value) => {
             if encoding == Encoding::Base64 && value != "OK" {
-                let encoded_len = base64_encoded_len(value.len())?;
-                charge(budget, encoded_len)?;
-                Ok(Value::String(STANDARD.encode(value.as_bytes())))
+                charge(budget, base64_encoded_len(value.len())?)
             } else {
-                charge(budget, value.len())?;
-                Ok(Value::String(value))
+                charge(budget, value.len())
             }
         }
         RespValue::Bulk(value) => {
             if encoding == Encoding::Base64 {
-                let encoded_len = base64_encoded_len(value.len())?;
-                charge(budget, encoded_len)?;
-                Ok(Value::String(STANDARD.encode(&value)))
+                charge(budget, base64_encoded_len(value.len())?)
             } else {
-                let value = String::from_utf8_lossy(&value).into_owned();
-                charge(budget, value.len())?;
-                Ok(Value::String(value))
+                // Charge what will actually be written: lossy conversion expands every
+                // invalid byte into a three-byte replacement character. Valid UTF-8 — the
+                // overwhelmingly common case — borrows, so this does not allocate.
+                charge(budget, String::from_utf8_lossy(value).len())
             }
         }
-        RespValue::Int(value) => Ok(Value::Number(value.into())),
-        RespValue::Nil => Ok(Value::Null),
+        RespValue::Int(_) | RespValue::Nil => Ok(()),
         RespValue::Array(values) => values
-            .into_iter()
-            .map(|value| convert_within_depth(value, encoding, budget, depth_remaining))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Value::Array),
+            .iter()
+            .try_for_each(|value| charge_within_depth(value, encoding, budget, depth_remaining)),
+    }
+}
+
+/// Serializes a RESP2 reply as Upstash JSON straight into the response body.
+///
+/// Building a `serde_json::Value` first would allocate a `String` for every bulk value and
+/// a `Vec` for every array, then walk the whole tree again to write it. Writing through
+/// the serializer skips that: a bulk value that is already valid UTF-8 is borrowed rather
+/// than copied.
+///
+/// Callers must charge [`charge_response_budget`] first — that is what bounds the nesting
+/// this type recurses over.
+pub struct ResponseJson<'a> {
+    value: &'a RespValue,
+    encoding: Encoding,
+}
+
+impl<'a> ResponseJson<'a> {
+    pub fn new(value: &'a RespValue, encoding: Encoding) -> Self {
+        Self { value, encoding }
+    }
+}
+
+impl Serialize for ResponseJson<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self.value {
+            RespValue::Simple(value) => {
+                if self.encoding == Encoding::Base64 && value != "OK" {
+                    serializer.serialize_str(&STANDARD.encode(value.as_bytes()))
+                } else {
+                    serializer.serialize_str(value)
+                }
+            }
+            RespValue::Bulk(value) => {
+                if self.encoding == Encoding::Base64 {
+                    // Encodes from the original raw bytes, never from a lossy string: that
+                    // is the entire reason the base64 encoding exists.
+                    serializer.serialize_str(&STANDARD.encode(value))
+                } else {
+                    serializer.serialize_str(&String::from_utf8_lossy(value))
+                }
+            }
+            RespValue::Int(value) => serializer.serialize_i64(*value),
+            RespValue::Nil => serializer.serialize_none(),
+            RespValue::Array(values) => {
+                let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    sequence.serialize_element(&Self::new(value, self.encoding))?;
+                }
+                sequence.end()
+            }
+        }
     }
 }
 
@@ -133,10 +173,20 @@ mod tests {
 
     use super::*;
 
+    /// Charges the budget and renders in one step, the way a handler does.
+    fn render(
+        value: &RespValue,
+        encoding: Encoding,
+        budget: &mut usize,
+    ) -> Result<Value, ConversionError> {
+        charge_response_budget(value, encoding, budget)?;
+        Ok(serde_json::to_value(ResponseJson::new(value, encoding))
+            .expect("RESP rendering is infallible"))
+    }
+
     #[test]
     fn converts_all_json_argument_kinds() {
-        let command = json_args_to_redis(&[
-            json!("SET"),
+        let arguments = [
             json!("key"),
             json!(100),
             json!(1.5),
@@ -144,11 +194,14 @@ mod tests {
             Value::Null,
             json!({"a": 1}),
             json!(["x", 2]),
-        ])
-        .unwrap();
-        assert_eq!(command.name, "SET");
+        ];
+        let converted = arguments
+            .iter()
+            .map(json_value_to_bytes)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(
-            command.args,
+            converted,
             [
                 "key",
                 "100",
@@ -163,16 +216,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_non_string_and_empty_command_names() {
-        for values in [vec![], vec![Value::Null], vec![json!("")]] {
-            assert_eq!(
-                json_args_to_redis(&values),
-                Err(ConversionError::InvalidCommand)
-            );
-        }
-    }
-
-    #[test]
     fn converts_every_resp2_value_recursively() {
         let value = RespValue::Array(vec![
             RespValue::Simple("OK".to_owned()),
@@ -183,7 +226,7 @@ mod tests {
         ]);
         let mut budget = 1024;
         assert_eq!(
-            redis_value_to_json(value, Encoding::None, &mut budget).unwrap(),
+            render(&value, Encoding::None, &mut budget).unwrap(),
             json!(["OK", "bar", 42, null, ["�a"]])
         );
     }
@@ -199,7 +242,7 @@ mod tests {
         ]);
         let mut budget = 1024;
         assert_eq!(
-            redis_value_to_json(value, Encoding::Base64, &mut budget).unwrap(),
+            render(&value, Encoding::Base64, &mut budget).unwrap(),
             json!(["OK", "YmFy", "//4AAQ==", 1, null])
         );
     }
@@ -212,7 +255,23 @@ mod tests {
         ]);
         let mut budget = NODE_COST * 3 + "first".len() + "second".len() - 1;
         assert_eq!(
-            redis_value_to_json(value, Encoding::None, &mut budget),
+            render(&value, Encoding::None, &mut budget),
+            Err(ConversionError::ResponseTooLarge)
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_is_charged_at_its_expanded_length() {
+        // Each invalid byte renders as U+FFFD, which is three bytes on the wire. Charging
+        // the raw length would let a reply of invalid bytes spend triple its budget.
+        let value = RespValue::Bulk(Bytes::from_static(&[0xff, 0xff]));
+        let mut exact = NODE_COST + 6;
+        assert!(render(&value, Encoding::None, &mut exact).is_ok());
+        assert_eq!(exact, 0);
+
+        let mut short = NODE_COST + 5;
+        assert_eq!(
+            render(&value, Encoding::None, &mut short),
             Err(ConversionError::ResponseTooLarge)
         );
     }
@@ -224,12 +283,12 @@ mod tests {
     #[test]
     fn nesting_is_bounded_without_exhausting_the_stack() {
         let mut budget = usize::MAX;
-        assert!(redis_value_to_json(nest(MAX_DEPTH - 1), Encoding::None, &mut budget).is_ok());
+        assert!(render(&nest(MAX_DEPTH - 1), Encoding::None, &mut budget).is_ok());
         // Deliberately just past the limit rather than enormous: dropping a
         // deeply nested `RespValue` is itself recursive, so the test value must
         // stay shallow enough to destroy safely.
         assert_eq!(
-            redis_value_to_json(nest(MAX_DEPTH + 8), Encoding::None, &mut budget),
+            render(&nest(MAX_DEPTH + 8), Encoding::None, &mut budget),
             Err(ConversionError::ResponseTooLarge),
             "a reply nested past MAX_DEPTH must be refused, not recursed"
         );
@@ -238,8 +297,8 @@ mod tests {
     #[test]
     fn base64_budget_uses_exact_padded_size() {
         let mut exact = NODE_COST + 4;
-        redis_value_to_json(
-            RespValue::Bulk(Bytes::from_static(b"x")),
+        render(
+            &RespValue::Bulk(Bytes::from_static(b"x")),
             Encoding::Base64,
             &mut exact,
         )

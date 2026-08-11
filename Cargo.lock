@@ -2745,6 +2745,7 @@ dependencies = [
  "jsonwebtoken",
  "metrics",
  "metrics-exporter-prometheus",
+ "pin-project-lite",
  "rcgen",
  "rustls",
  "serde",
@@ -3096,7 +3097,6 @@ dependencies = [
  "tokio",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]

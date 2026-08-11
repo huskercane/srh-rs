@@ -1,7 +1,8 @@
-use serde_json::Value;
+use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use crate::domain::identity::Identity;
+use crate::ports::RedisCommand;
 
 // These commands may inspect or control the server, topology, or replication state. The
 // protocol/session subset is also a correctness boundary for pooled connections: HELLO changes
@@ -155,15 +156,20 @@ pub enum AclError {
     Forbidden(String),
 }
 
-/// Checks one complete JSON command against an authenticated identity.
-pub fn check(identity: &Identity, command: &[Value]) -> Result<(), AclError> {
-    let name = command
-        .first()
-        .and_then(Value::as_str)
-        .filter(|name| !name.is_empty())
-        .ok_or(AclError::InvalidCommand)?
-        .to_ascii_uppercase();
-    let admin_allowed = identity.is_admin && admin_allow(&name, command.get(1));
+/// Checks one converted command against an authenticated identity.
+///
+/// Arguments arrive already encoded as the bytes that will be sent to Redis. That is the
+/// same encoding the old `Value`-based check applied before comparing, so the matching is
+/// unchanged — a JSON number, bool, null, array or object still renders to text that
+/// cannot collide with a keyword — and the scripting check no longer re-converts the
+/// script body just to digest it.
+pub fn check(identity: &Identity, command: &RedisCommand) -> Result<(), AclError> {
+    let name = command.name.as_str();
+    if name.is_empty() {
+        return Err(AclError::InvalidCommand);
+    }
+    let name = name.to_ascii_uppercase();
+    let admin_allowed = identity.is_admin && admin_allow(&name, command.args.first());
 
     // An explicit admin allowlist fails closed as Redis adds commands. An exemption with
     // carve-outs would accidentally permit hazards such as MODULE LOAD, MIGRATE, or SLAVEOF.
@@ -174,11 +180,10 @@ pub fn check(identity: &Identity, command: &[Value]) -> Result<(), AclError> {
     check_scripting(identity, &name, command)?;
 
     if matches!(name.as_str(), "XREAD" | "XREADGROUP")
-        && command.iter().skip(1).any(|value| {
-            value
-                .as_str()
-                .is_some_and(|argument| argument.eq_ignore_ascii_case("BLOCK"))
-        })
+        && command
+            .args
+            .iter()
+            .any(|argument| argument.as_ref().eq_ignore_ascii_case(b"BLOCK"))
     {
         return Err(AclError::Forbidden(
             "NOPERM blocking XREAD is not allowed".to_owned(),
@@ -189,10 +194,9 @@ pub fn check(identity: &Identity, command: &[Value]) -> Result<(), AclError> {
     // BY/GET. Phase 8 will extend this hook to the rest of the key-spec policy.
     if identity.key_prefix.is_some()
         && matches!(name.as_str(), "SORT" | "SORT_RO")
-        && command.iter().skip(1).any(|value| {
-            value.as_str().is_some_and(|argument| {
-                argument.eq_ignore_ascii_case("BY") || argument.eq_ignore_ascii_case("GET")
-            })
+        && command.args.iter().any(|argument| {
+            argument.as_ref().eq_ignore_ascii_case(b"BY")
+                || argument.as_ref().eq_ignore_ascii_case(b"GET")
         })
     {
         return Err(denied(&name));
@@ -225,7 +229,11 @@ pub fn check(identity: &Identity, command: &[Value]) -> Result<(), AclError> {
     Ok(())
 }
 
-fn check_scripting(identity: &Identity, name: &str, command: &[Value]) -> Result<(), AclError> {
+fn check_scripting(
+    identity: &Identity,
+    name: &str,
+    command: &RedisCommand,
+) -> Result<(), AclError> {
     if !SCRIPTING.contains(&name) {
         return Ok(());
     }
@@ -234,29 +242,16 @@ fn check_scripting(identity: &Identity, name: &str, command: &[Value]) -> Result
     if !matches!(name, "EVAL" | "EVAL_RO") || identity.allowed_script_sha256.is_empty() {
         return Err(denied(name));
     }
-    let script = command.get(1).ok_or_else(|| denied(name))?;
-    let script = argument_bytes(script).ok_or_else(|| denied(name))?;
-    let digest = hex_digest(&Sha256::digest(&script));
+    let script = command.args.first().ok_or_else(|| denied(name))?;
+    let digest = hex_digest(&Sha256::digest(script));
     if !identity.allowed_script_sha256.contains(&digest) {
         return Err(denied(name));
     }
     Ok(())
 }
 
-fn argument_bytes(value: &Value) -> Option<Vec<u8>> {
-    match value {
-        Value::String(value) => Some(value.as_bytes().to_vec()),
-        Value::Number(value) => Some(value.to_string().into_bytes()),
-        Value::Bool(value) => Some(value.to_string().into_bytes()),
-        Value::Null => Some(b"null".to_vec()),
-        Value::Array(_) | Value::Object(_) => serde_json::to_vec(value).ok(),
-    }
-}
-
-fn admin_allow(name: &str, subcommand: Option<&Value>) -> bool {
-    let subcommand = subcommand
-        .and_then(Value::as_str)
-        .map(str::to_ascii_uppercase);
+fn admin_allow(name: &str, subcommand: Option<&Bytes>) -> bool {
+    let subcommand = subcommand.map(|value| String::from_utf8_lossy(value).to_ascii_uppercase());
     matches!(
         (name, subcommand.as_deref()),
         ("CONFIG", Some("GET"))
@@ -289,7 +284,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 mod tests {
     use std::collections::HashSet;
 
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
 
@@ -308,9 +303,29 @@ mod tests {
         }
     }
 
+    /// Builds the converted command a request would produce from a JSON array literal,
+    /// using the same argument encoding `http::parse` applies.
+    fn parsed(command: &Value) -> RedisCommand {
+        let values = command.as_array().expect("command array");
+        RedisCommand {
+            name: values
+                .first()
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            args: values[1..]
+                .iter()
+                .map(|value| {
+                    crate::domain::convert::json_value_to_bytes(value)
+                        .expect("test arguments are representable")
+                })
+                .collect(),
+        }
+    }
+
     fn assert_denied(identity: &Identity, command: Value) {
         assert!(matches!(
-            check(identity, command.as_array().expect("command array")),
+            check(identity, &parsed(&command)),
             Err(AclError::Forbidden(_))
         ));
     }
@@ -323,7 +338,7 @@ mod tests {
             json!(["GET", "key"]),
             json!(["XREAD", "STREAMS", "key", "0"]),
         ] {
-            check(&identity, command.as_array().unwrap()).unwrap();
+            check(&identity, &parsed(&command)).unwrap();
         }
         for command in [
             json!(["SET", "key", "v"]),
@@ -430,7 +445,7 @@ mod tests {
         ] {
             assert_denied(&identity, command);
         }
-        check(&identity, &[json!("get"), json!("key")]).unwrap();
+        check(&identity, &parsed(&json!(["get", "key"]))).unwrap();
     }
 
     #[test]
@@ -443,7 +458,7 @@ mod tests {
             json!(["MEMORY", "USAGE", "key"]),
             json!(["INFO"]),
         ] {
-            check(&admin, command.as_array().unwrap()).unwrap();
+            check(&admin, &parsed(&command)).unwrap();
         }
         for command in [
             json!(["HELLO", 2]),
@@ -465,23 +480,23 @@ mod tests {
         for name in ["FLUSHALL", "FLUSHDB", "KEYS", "RANDOMKEY", "INFO", "DBSIZE"] {
             assert_denied(&current, json!([name]));
         }
-        check(&current, &[json!("SCAN"), json!(0)]).unwrap();
+        check(&current, &parsed(&json!(["SCAN", 0]))).unwrap();
         current.allowed_commands = Some(HashSet::from(["KEYS".to_owned()]));
-        check(&current, &[json!("KEYS"), json!("*")]).unwrap();
+        check(&current, &parsed(&json!(["KEYS", "*"]))).unwrap();
 
         let mut legacy = identity();
         legacy.legacy = true;
-        check(&legacy, &[json!("FLUSHALL")]).unwrap();
-        check(&legacy, &[json!("KEYS"), json!("*")]).unwrap();
-        check(&legacy, &[json!("DBSIZE")]).unwrap();
-        check(&legacy, &[json!("INFO")]).unwrap();
+        check(&legacy, &parsed(&json!(["FLUSHALL"]))).unwrap();
+        check(&legacy, &parsed(&json!(["KEYS", "*"]))).unwrap();
+        check(&legacy, &parsed(&json!(["DBSIZE"]))).unwrap();
+        check(&legacy, &parsed(&json!(["INFO"]))).unwrap();
     }
 
     #[test]
     fn explicit_command_allowlist_rejects_every_command_not_named() {
         let mut identity = identity();
         identity.allowed_commands = Some(HashSet::from(["GET".to_owned()]));
-        check(&identity, &[json!("GET"), json!("key")]).unwrap();
+        check(&identity, &parsed(&json!(["GET", "key"]))).unwrap();
         assert_denied(&identity, json!(["MGET", "one", "two"]));
     }
 
@@ -492,11 +507,7 @@ mod tests {
         let mut identity = identity();
         identity.allowed_script_sha256.insert(digest);
         identity.allowed_commands = Some(HashSet::from(["EVAL".to_owned()]));
-        check(
-            &identity,
-            &[json!("EVAL"), json!(script), json!(1), json!("key")],
-        )
-        .unwrap();
+        check(&identity, &parsed(&json!(["EVAL", script, 1, "key"]))).unwrap();
 
         identity.read_only = true;
         assert_denied(&identity, json!(["EVAL", script, 1, "key"]));
@@ -515,19 +526,15 @@ mod tests {
     fn argument_guards_reject_blocking_xread_and_indirect_sort_keys() {
         let mut identity = identity();
         identity.read_only = true;
-        check(
-            &identity,
-            &[json!("XREAD"), json!("STREAMS"), json!("key"), json!("0")],
-        )
-        .unwrap();
+        check(&identity, &parsed(&json!(["XREAD", "STREAMS", "key", "0"]))).unwrap();
         assert_eq!(
-            check(&identity, &[json!("XREAD"), json!("BLOCK"), json!(0)]),
+            check(&identity, &parsed(&json!(["XREAD", "BLOCK", 0]))),
             Err(AclError::Forbidden(
                 "NOPERM blocking XREAD is not allowed".to_owned()
             ))
         );
         assert_eq!(
-            check(&identity, &[json!("XREAD"), json!("block"), json!(0)]),
+            check(&identity, &parsed(&json!(["XREAD", "block", 0]))),
             Err(AclError::Forbidden(
                 "NOPERM blocking XREAD is not allowed".to_owned()
             ))
