@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::extract::FromRequestParts;
 use axum::http::{header, request::Parts};
 
@@ -5,7 +7,7 @@ use crate::AppState;
 use crate::domain::identity::{AuthError, Identity};
 use crate::error::AppError;
 
-pub struct AuthedIdentity(pub Identity);
+pub struct AuthedIdentity(pub Arc<Identity>);
 
 impl FromRequestParts<AppState> for AuthedIdentity {
     type Rejection = AppError;

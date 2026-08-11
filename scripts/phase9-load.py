@@ -231,6 +231,35 @@ async def unloaded_p99(host: str, port: int) -> float:
     return percentile([sample.latency_ms for sample in samples], 0.99)
 
 
+async def cpu_profile(args: argparse.Namespace) -> None:
+    """Drive the stable happy path used for comparable CPU profiles."""
+    seed = await request(args.host, args.http_port, b'["SET","load:key","phase9-value"]')
+    assert seed.status == 200, seed
+    if args.warm_duration > 0:
+        warm_samples, warm_errors = await load(
+            args.host, args.http_port, args.concurrency, args.warm_duration
+        )
+        assert not warm_errors, f"warm-up connection failures: {warm_errors[:5]}"
+        assert all(sample.status == 200 for sample in warm_samples), (
+            "canonical profile warm-up must not exercise rejection paths"
+        )
+
+    samples, errors = await load(
+        args.host, args.http_port, args.concurrency, args.duration
+    )
+    assert not errors, f"profile connection failures: {errors[:5]}"
+    unexpected = [sample.status for sample in samples if sample.status != 200]
+    assert not unexpected, f"canonical profile returned non-200 statuses: {unexpected[:20]}"
+    latencies = [sample.latency_ms for sample in samples]
+    assert latencies, "canonical profile produced no responses"
+    print(
+        f"cpu profile: {len(samples) / args.duration:.1f} req/s; "
+        f"p50={percentile(latencies, 0.50):.2f}ms; "
+        f"p99={percentile(latencies, 0.99):.2f}ms; "
+        f"responses={len(samples)}"
+    )
+
+
 async def assert_recovered(host: str, port: int) -> None:
     expected = json.dumps({"result": "phase9-value"}, separators=(",", ":")).encode()
     for _ in range(100):
@@ -420,7 +449,9 @@ async def slow_clients(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("profile", choices=("overload", "backend-death", "slow-client"))
+    parser.add_argument(
+        "profile", choices=("cpu", "overload", "backend-death", "slow-client")
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--http-port", type=int, default=18080)
     parser.add_argument("--metrics-port", type=int, default=19090)
@@ -436,7 +467,9 @@ def parse_args() -> argparse.Namespace:
 
 async def main() -> None:
     args = parse_args()
-    if args.profile == "overload":
+    if args.profile == "cpu":
+        await cpu_profile(args)
+    elif args.profile == "overload":
         await overload(args)
     elif args.profile == "backend-death":
         await backend_death(args)

@@ -17,7 +17,7 @@ impl AuthChain {
 
 #[async_trait]
 impl Authenticator for AuthChain {
-    async fn authenticate(&self, bearer: &str) -> Result<Option<Identity>, AuthError> {
+    async fn authenticate(&self, bearer: &str) -> Result<Option<Arc<Identity>>, AuthError> {
         for link in &self.links {
             if let Some(identity) = link.authenticate(bearer).await? {
                 return Ok(Some(identity));
@@ -37,7 +37,7 @@ mod tests {
 
     #[async_trait]
     impl Authenticator for Abstain {
-        async fn authenticate(&self, _bearer: &str) -> Result<Option<Identity>, AuthError> {
+        async fn authenticate(&self, _bearer: &str) -> Result<Option<Arc<Identity>>, AuthError> {
             Ok(None)
         }
     }
@@ -46,7 +46,7 @@ mod tests {
 
     #[async_trait]
     impl Authenticator for Reject {
-        async fn authenticate(&self, _bearer: &str) -> Result<Option<Identity>, AuthError> {
+        async fn authenticate(&self, _bearer: &str) -> Result<Option<Arc<Identity>>, AuthError> {
             Err(AuthError::Rejected)
         }
     }

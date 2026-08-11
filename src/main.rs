@@ -20,7 +20,7 @@ use srh_rs::adapters::system_clock::SystemClock;
 use srh_rs::config::Config;
 use srh_rs::domain::rate_limit::RateLimiter;
 use srh_rs::ports::{Authenticator, Clock, ExecutorProvider, Introspector, JwksSource};
-use srh_rs::{AppState, http};
+use srh_rs::{AppState, AppStateInner, http};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -88,13 +88,13 @@ async fn main() -> Result<()> {
     ));
     let pool_manager = Arc::new(PoolManager::new(Arc::clone(&config), Arc::clone(&clock)));
     let provider: Arc<dyn ExecutorProvider> = pool_manager.clone();
-    let state = AppState {
+    let state = AppState::new(AppStateInner {
         provider,
         authenticator,
         clock,
         rate_limiter: Arc::clone(&rate_limiter),
         cfg: Arc::clone(&config),
-    };
+    });
     let address = bind_address(&config.server.bind, config.server.port);
     let listener = TcpListener::bind(&address)
         .await

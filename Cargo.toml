@@ -11,7 +11,7 @@ testsupport = []
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-axum = { version = "0.8", features = ["macros"] }
+axum = "0.8"
 base64 = "0.23.1"
 bytes = "1"
 dashmap = "6"
@@ -42,3 +42,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 testcontainers = "0.28.0"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 wiremock = "0.6"
+
+# Release optimizations with symbols retained for perf/flamegraph attribution.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

@@ -87,7 +87,7 @@ pub trait ExecutorProvider: Send + Sync {
 /// Authenticates a bearer credential.
 #[async_trait]
 pub trait Authenticator: Send + Sync {
-    async fn authenticate(&self, bearer: &str) -> Result<Option<Identity>, AuthError>;
+    async fn authenticate(&self, bearer: &str) -> Result<Option<Arc<Identity>>, AuthError>;
 }
 
 /// Supplies trusted JWT verification keys.

@@ -1,0 +1,38 @@
+{
+  "server": {
+    "port": 18080,
+    "bind": "127.0.0.1",
+    "http_timeout_ms": 5000,
+    "metrics_bind": "127.0.0.1:19090",
+    "load": {
+      "max_in_flight": 128,
+      "max_response_bytes": 1048576,
+      "shed_retry_after_secs": 1,
+      "body_read_timeout_ms": 2000
+    },
+    "rate_limit": {
+      "per_token_commands_per_sec": 1000000
+    }
+  },
+  "auth": {
+    "static_tokens": {
+      "phase9-load-token": {
+        "pool": "profile",
+        "allowed_commands": ["GET", "SET"]
+      }
+    }
+  },
+  "pools": {
+    "profile": {
+      "connection_string": "redis://127.0.0.1:16379",
+      "max_connections": 32,
+      "max_waiters": 32,
+      "acquire_timeout_ms": 1000,
+      "command_timeout_ms": 1000,
+      "breaker": {
+        "failure_threshold": 3,
+        "cooldown_ms": 1000
+      }
+    }
+  }
+}

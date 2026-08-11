@@ -10,7 +10,6 @@ permissions:
 
 env:
   BIN_NAME: srh-rs
-  TARGET: x86_64-unknown-linux-musl
 
 jobs:
   validate:
@@ -32,31 +31,67 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   binary:
-    name: Build static Linux binary
+    name: Build ${{ matrix.label }} binary
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Fully static. Required by the distroless base, which ships no libc at all,
+          # and portable to any host regardless of its glibc version.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            label: static musl
+            linkage: static
+          # Dynamically linked against glibc, for the systemd deployment. This workload
+          # spends roughly a tenth of its CPU in the allocator and musl's mallocng
+          # contends far worse across threads than glibc's, so the glibc build is the
+          # faster native-host artifact. Built on the oldest supported runner to keep
+          # the required glibc version low.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            label: glibc
+            linkage: dynamic
+    env:
+      TARGET: ${{ matrix.target }}
+      LINKAGE: ${{ matrix.linkage }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.0
-          targets: ${{ env.TARGET }}
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ env.TARGET }}
+          key: release-${{ matrix.target }}
       - name: Install musl tools
+        if: matrix.linkage == 'static'
         run: |
           sudo apt-get update
           sudo apt-get install --yes musl-tools
-      - name: Build and verify the static release binary
+      - name: Build and verify the release binary
         shell: bash
         run: |
           set -euo pipefail
           cargo build --release --locked --target "$TARGET"
-          strip "target/$TARGET/release/$BIN_NAME"
-          output=$(ldd "target/$TARGET/release/$BIN_NAME" 2>&1 || true)
+          binary="target/$TARGET/release/$BIN_NAME"
+          strip "$binary"
+          output=$(ldd "$binary" 2>&1 || true)
           echo "$output"
-          grep -Eq "not a dynamic executable|statically linked" <<<"$output"
+          if [[ "$LINKAGE" == "static" ]]; then
+            grep -Eq "not a dynamic executable|statically linked" <<<"$output"
+          else
+            # A silently static "glibc" build would defeat the point of this target, so
+            # assert the linkage positively rather than trusting the target triple.
+            grep -q "libc.so.6" <<<"$output"
+            # Record the glibc floor: this binary will not start on an older host, and
+            # that limit is invisible until someone deploys it.
+            floor=$(objdump -T "$binary" \
+              | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sort -uV | tail -1 || true)
+            test -n "$floor"
+            echo "\`$TARGET\` requires **$floor** or newer" >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Package binary, service unit, and checksums
         shell: bash
         run: |
@@ -71,10 +106,10 @@ jobs:
           sha256sum "$asset.tar.gz" > "$asset.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
         with:
-          name: srh-rs-v${{ needs.validate.outputs.version }}-${{ env.TARGET }}
+          name: srh-rs-v${{ needs.validate.outputs.version }}-${{ matrix.target }}
           path: |
-            srh-rs-v${{ needs.validate.outputs.version }}-${{ env.TARGET }}.tar.gz
-            srh-rs-v${{ needs.validate.outputs.version }}-${{ env.TARGET }}.tar.gz.sha256
+            srh-rs-v${{ needs.validate.outputs.version }}-${{ matrix.target }}.tar.gz
+            srh-rs-v${{ needs.validate.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error
 
   image:

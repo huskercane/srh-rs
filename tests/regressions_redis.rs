@@ -10,7 +10,6 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
 use serde_json::{Value, json};
-use srh_rs::AppState;
 use srh_rs::adapters::auth_chain::AuthChain;
 use srh_rs::adapters::fred_executor::FredExecutor;
 use srh_rs::adapters::pool_manager::PoolManager;
@@ -19,6 +18,7 @@ use srh_rs::config::Config;
 use srh_rs::domain::rate_limit::RateLimiter;
 use srh_rs::domain::resp::RespValue;
 use srh_rs::ports::{Authenticator, Clock, CommandExecutor, ExecutorProvider, RedisCommand};
+use srh_rs::{AppState, AppStateInner};
 use testcontainers::ContainerAsync;
 use testcontainers::GenericImage;
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -72,13 +72,13 @@ fn app(connection_string: String, manager: &mut Option<Arc<PoolManager>>) -> axu
     let pools = Arc::new(PoolManager::new(Arc::clone(&config), Arc::clone(&clock)));
     let provider: Arc<dyn ExecutorProvider> = pools.clone();
     *manager = Some(pools);
-    srh_rs::http::router(AppState {
+    srh_rs::http::router(AppState::new(AppStateInner {
         provider,
         authenticator: Arc::new(AuthChain::new(vec![static_auth])),
         clock: Arc::clone(&clock),
         rate_limiter: Arc::new(RateLimiter::new(0, clock)),
         cfg: config,
-    })
+    }))
 }
 
 async fn post(app: &axum::Router, path: &str, payload: Value) -> (StatusCode, Value) {

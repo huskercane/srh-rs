@@ -11,12 +11,12 @@ use axum::extract::ConnectInfo;
 use axum::http::header;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use srh_rs::AppState;
 use srh_rs::config::Config;
 use srh_rs::domain::identity::{AuthError, Identity};
 use srh_rs::domain::rate_limit::RateLimiter;
 use srh_rs::domain::resp::{AcquireError, PoolReadiness, PoolReadinessStatus};
 use srh_rs::ports::{Authenticator, Clock, ExecutorHandle, ExecutorProvider};
+use srh_rs::{AppState, AppStateInner};
 use tower::ServiceExt;
 
 struct Provider {
@@ -43,8 +43,8 @@ struct Auth;
 
 #[async_trait]
 impl Authenticator for Auth {
-    async fn authenticate(&self, _bearer: &str) -> Result<Option<Identity>, AuthError> {
-        Ok(Some(Identity {
+    async fn authenticate(&self, _bearer: &str) -> Result<Option<Arc<Identity>>, AuthError> {
+        Ok(Some(Arc::new(Identity {
             subject: "test".to_owned(),
             bucket_key: "test".to_owned(),
             pool: "cache".to_owned(),
@@ -55,7 +55,7 @@ impl Authenticator for Auth {
             blocked_commands: HashSet::new(),
             allowed_script_sha256: HashSet::new(),
             key_prefix: None,
-        }))
+        })))
     }
 }
 
@@ -80,13 +80,13 @@ fn app(status: PoolReadinessStatus) -> (axum::Router, Arc<Provider>) {
     });
     let provider_port: Arc<dyn ExecutorProvider> = provider.clone();
     let clock: Arc<dyn Clock> = Arc::new(TestClock);
-    let app = srh_rs::http::router(AppState {
+    let app = srh_rs::http::router(AppState::new(AppStateInner {
         provider: provider_port,
         authenticator: Arc::new(Auth),
         clock: Arc::clone(&clock),
         rate_limiter: Arc::new(RateLimiter::new(0, clock)),
         cfg: config,
-    });
+    }));
     (app, provider)
 }
 

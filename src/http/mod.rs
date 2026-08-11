@@ -98,6 +98,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::AppStateInner;
     use crate::config::Config;
     use crate::domain::identity::{AuthError, Identity};
     use crate::domain::resp::{AcquireError, PoolReadiness};
@@ -120,7 +121,7 @@ mod tests {
 
     #[async_trait]
     impl Authenticator for UnusedAuthenticator {
-        async fn authenticate(&self, _bearer: &str) -> Result<Option<Identity>, AuthError> {
+        async fn authenticate(&self, _bearer: &str) -> Result<Option<Arc<Identity>>, AuthError> {
             unreachable!("concurrency test routes do not authenticate")
         }
     }
@@ -129,8 +130,8 @@ mod tests {
 
     #[async_trait]
     impl Authenticator for AllowAuthenticator {
-        async fn authenticate(&self, _bearer: &str) -> Result<Option<Identity>, AuthError> {
-            Ok(Some(Identity {
+        async fn authenticate(&self, _bearer: &str) -> Result<Option<Arc<Identity>>, AuthError> {
+            Ok(Some(Arc::new(Identity {
                 subject: "test".to_owned(),
                 bucket_key: "test".to_owned(),
                 pool: "test".to_owned(),
@@ -141,7 +142,7 @@ mod tests {
                 blocked_commands: HashSet::new(),
                 allowed_script_sha256: HashSet::new(),
                 key_prefix: None,
-            }))
+            })))
         }
     }
 
@@ -223,7 +224,7 @@ mod tests {
             entered: Notify::new(),
             release: Semaphore::new(0),
         });
-        let state = AppState {
+        let state = AppState::new(AppStateInner {
             provider: Arc::new(UnusedProvider),
             authenticator: Arc::new(UnusedAuthenticator),
             clock: Arc::new(TestClock),
@@ -232,7 +233,7 @@ mod tests {
                 Arc::new(TestClock),
             )),
             cfg: Arc::clone(&config),
-        };
+        });
         let api = Router::new()
             .route("/one", get(slow))
             .route("/two", get(slow))
@@ -279,7 +280,7 @@ mod tests {
             entered: Notify::new(),
             release: Semaphore::new(0),
         });
-        let state = AppState {
+        let state = AppState::new(AppStateInner {
             provider: provider.clone(),
             authenticator: Arc::new(AllowAuthenticator),
             clock: Arc::new(TestClock),
@@ -288,7 +289,7 @@ mod tests {
                 Arc::new(TestClock),
             )),
             cfg: config,
-        };
+        });
         let app = router(state);
 
         let first = tokio::spawn(app.clone().oneshot(api_request("/", r#"["PING"]"#)));

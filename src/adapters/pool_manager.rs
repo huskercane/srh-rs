@@ -31,6 +31,7 @@ pub struct PoolManager {
 
 struct PoolEntry {
     pool: Pool,
+    metrics: PoolMetrics,
     client_leases: Vec<Arc<tokio::sync::Mutex<()>>>,
     client_operations: Vec<Arc<tokio::sync::Mutex<()>>>,
     next_client: AtomicUsize,
@@ -43,6 +44,29 @@ struct PoolEntry {
     acquire_timeout: Duration,
     command_timeout: Duration,
     breaker: Arc<Breaker>,
+}
+
+struct PoolMetrics {
+    active_connections: metrics::Gauge,
+    permits_in_use: metrics::Gauge,
+    waiter_depth: metrics::Gauge,
+}
+
+impl PoolMetrics {
+    fn new(name: &str) -> Self {
+        let active_connections =
+            metrics::gauge!("srh_pool_active_connections", "pool" => name.to_owned());
+        let permits_in_use = metrics::gauge!("srh_pool_permits_in_use", "pool" => name.to_owned());
+        let waiter_depth = metrics::gauge!("srh_pool_waiter_depth", "pool" => name.to_owned());
+        active_connections.set(0.0);
+        permits_in_use.set(0.0);
+        waiter_depth.set(0.0);
+        Self {
+            active_connections,
+            permits_in_use,
+            waiter_depth,
+        }
+    }
 }
 
 impl PoolManager {
@@ -104,9 +128,7 @@ impl PoolManager {
         // `connect` starts reconnect loops but does not wait for or ping Redis.
         let connection_task = pool.connect();
         metrics::gauge!("srh_pool_breaker_state", "pool" => name.to_owned()).set(0.0);
-        metrics::gauge!("srh_pool_active_connections", "pool" => name.to_owned()).set(0.0);
-        metrics::gauge!("srh_pool_permits_in_use", "pool" => name.to_owned()).set(0.0);
-        metrics::gauge!("srh_pool_waiter_depth", "pool" => name.to_owned()).set(0.0);
+        let metrics = PoolMetrics::new(name);
         tracing::info!(
             pool = name,
             size = pool_config.max_connections,
@@ -121,6 +143,7 @@ impl PoolManager {
                 .collect(),
             next_client: AtomicUsize::new(0),
             pool,
+            metrics,
             connection_tasks: Mutex::new(vec![connection_task]),
             last_used: AtomicU64::new(self.clock.unix_secs()),
             permits: Arc::new(tokio::sync::Semaphore::new(pool_config.max_connections)),
@@ -171,11 +194,10 @@ impl PoolManager {
                 metrics::counter!("srh_shed_total", "cause" => "pool_queue_full").increment(1);
                 AcquireError::Overloaded
             })?;
-        metrics::gauge!("srh_pool_waiter_depth", "pool" => name.to_owned())
-            .set(waiter_depth as f64);
+        entry.metrics.waiter_depth.set(waiter_depth as f64);
         let waiter = WaiterGuard {
             count: Arc::clone(&entry.waiters),
-            pool: name.to_owned(),
+            gauge: entry.metrics.waiter_depth.clone(),
         };
         let permit = tokio::time::timeout(
             entry.acquire_timeout,
@@ -188,9 +210,7 @@ impl PoolManager {
         })?
         .map_err(|_| AcquireError::Internal("Redis pool semaphore closed".to_owned()))?;
         drop(waiter);
-        metrics::gauge!("srh_pool_permits_in_use", "pool" => name.to_owned()).increment(1.0);
-        metrics::gauge!("srh_pool_active_connections", "pool" => name.to_owned())
-            .set(entry.pool.active_connections().len() as f64);
+        entry.metrics.permits_in_use.increment(1.0);
 
         let (client, client_lease, operation_lock) = entry.acquire_client().await;
 
@@ -211,7 +231,7 @@ impl PoolManager {
             Box::new(PoolLease {
                 _permit: permit,
                 _client_lease: client_lease,
-                pool: name.to_owned(),
+                permits_in_use: entry.metrics.permits_in_use.clone(),
             }),
         ))
     }
@@ -222,6 +242,14 @@ impl PoolManager {
         let names: Vec<String> = self.pools.iter().map(|entry| entry.key().clone()).collect();
         let mut evicted = 0;
         for name in names {
+            if let Some(entry) = self.pools.get(&name) {
+                // Fred materializes a Vec while collecting this value. Sampling during the
+                // maintenance pass keeps that allocation out of every command acquisition.
+                entry
+                    .metrics
+                    .active_connections
+                    .set(entry.pool.active_connections().len() as f64);
+            }
             if let Some((_, entry)) = self.pools.remove_if(&name, |_, entry| {
                 now.saturating_sub(entry.last_used.load(Ordering::Acquire)) > IDLE_EVICTION_SECS
                     && entry.permits.available_permits() == entry.permit_count
@@ -230,9 +258,9 @@ impl PoolManager {
                 entry.shutdown().await;
                 evicted += 1;
                 metrics::counter!("srh_pool_evictions_total", "pool" => name.clone()).increment(1);
-                metrics::gauge!("srh_pool_active_connections", "pool" => name.clone()).set(0.0);
-                metrics::gauge!("srh_pool_permits_in_use", "pool" => name.clone()).set(0.0);
-                metrics::gauge!("srh_pool_waiter_depth", "pool" => name.clone()).set(0.0);
+                entry.metrics.active_connections.set(0.0);
+                entry.metrics.permits_in_use.set(0.0);
+                entry.metrics.waiter_depth.set(0.0);
                 tracing::info!(pool = %name, "evicted idle Redis pool");
             }
         }
@@ -304,26 +332,25 @@ impl ExecutorProvider for PoolManager {
 
 struct WaiterGuard {
     count: Arc<AtomicUsize>,
-    pool: String,
+    gauge: metrics::Gauge,
 }
 
 impl Drop for WaiterGuard {
     fn drop(&mut self) {
         let previous = self.count.fetch_sub(1, Ordering::AcqRel);
-        metrics::gauge!("srh_pool_waiter_depth", "pool" => self.pool.clone())
-            .set(previous.saturating_sub(1) as f64);
+        self.gauge.set(previous.saturating_sub(1) as f64);
     }
 }
 
 struct PoolLease {
     _permit: tokio::sync::OwnedSemaphorePermit,
     _client_lease: tokio::sync::OwnedMutexGuard<()>,
-    pool: String,
+    permits_in_use: metrics::Gauge,
 }
 
 impl Drop for PoolLease {
     fn drop(&mut self) {
-        metrics::gauge!("srh_pool_permits_in_use", "pool" => self.pool.clone()).decrement(1.0);
+        self.permits_in_use.decrement(1.0);
     }
 }
 

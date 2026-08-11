@@ -297,7 +297,7 @@ impl JwtAuth {
 
 #[async_trait]
 impl Authenticator for JwtAuth {
-    async fn authenticate(&self, bearer: &str) -> Result<Option<Identity>, AuthError> {
+    async fn authenticate(&self, bearer: &str) -> Result<Option<Arc<Identity>>, AuthError> {
         if bearer.bytes().filter(|byte| *byte == b'.').count() != 2 {
             return Ok(None);
         }
@@ -308,7 +308,9 @@ impl Authenticator for JwtAuth {
                 Ok(None)
             };
         }
-        self.validate(bearer).await.map(Some)
+        self.validate(bearer)
+            .await
+            .map(|identity| Some(Arc::new(identity)))
     }
 }
 

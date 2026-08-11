@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use serde_json::{Value, json};
-use srh_rs::AppState;
 use srh_rs::adapters::auth_chain::AuthChain;
 use srh_rs::adapters::static_auth::StaticAuth;
 use srh_rs::config::Config;
@@ -15,6 +14,7 @@ use srh_rs::domain::resp::{AcquireError, ExecError, PoolReadiness, RespValue};
 use srh_rs::ports::{
     Authenticator, Clock, CommandExecutor, ExecutorHandle, ExecutorProvider, RedisCommand,
 };
+use srh_rs::{AppState, AppStateInner};
 use tower::ServiceExt;
 
 struct ScriptedExecutor {
@@ -123,7 +123,7 @@ fn app(
         executor,
         acquires: AtomicUsize::new(0),
     });
-    let router = srh_rs::http::router(AppState {
+    let router = srh_rs::http::router(AppState::new(AppStateInner {
         provider: provider.clone(),
         authenticator: Arc::new(AuthChain::new(vec![static_auth])),
         clock: Arc::new(TestClock),
@@ -132,7 +132,7 @@ fn app(
             Arc::new(TestClock),
         )),
         cfg: config,
-    });
+    }));
     (router, provider)
 }
 

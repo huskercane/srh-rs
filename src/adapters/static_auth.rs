@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -8,35 +9,39 @@ use crate::domain::identity::{AuthError, Identity};
 use crate::ports::Authenticator;
 
 pub struct StaticAuth {
-    tokens: HashMap<[u8; 32], StaticTokenConfig>,
+    identities: HashMap<[u8; 32], Arc<Identity>>,
 }
 
 impl StaticAuth {
     pub fn new(tokens: HashMap<[u8; 32], StaticTokenConfig>) -> Self {
-        Self { tokens }
+        let identities = tokens
+            .into_iter()
+            .map(|(digest, token)| {
+                let bucket_key = digest_hex(&digest);
+                let identity = Identity {
+                    subject: bucket_key[..8].to_owned(),
+                    bucket_key,
+                    pool: token.pool,
+                    read_only: token.read_only,
+                    is_admin: false,
+                    legacy: token.legacy,
+                    allowed_commands: token.allowed_commands,
+                    blocked_commands: token.blocked_commands,
+                    allowed_script_sha256: token.allowed_script_sha256,
+                    key_prefix: token.key_prefix,
+                };
+                (digest, Arc::new(identity))
+            })
+            .collect();
+        Self { identities }
     }
 }
 
 #[async_trait]
 impl Authenticator for StaticAuth {
-    async fn authenticate(&self, bearer: &str) -> Result<Option<Identity>, AuthError> {
+    async fn authenticate(&self, bearer: &str) -> Result<Option<Arc<Identity>>, AuthError> {
         let digest: [u8; 32] = Sha256::digest(bearer.as_bytes()).into();
-        let Some(token) = self.tokens.get(&digest) else {
-            return Ok(None);
-        };
-        let bucket_key = digest_hex(&digest);
-        Ok(Some(Identity {
-            subject: bucket_key[..8].to_owned(),
-            bucket_key,
-            pool: token.pool.clone(),
-            read_only: token.read_only,
-            is_admin: false,
-            legacy: token.legacy,
-            allowed_commands: token.allowed_commands.clone(),
-            blocked_commands: token.blocked_commands.clone(),
-            allowed_script_sha256: token.allowed_script_sha256.clone(),
-            key_prefix: token.key_prefix.clone(),
-        }))
+        Ok(self.identities.get(&digest).map(Arc::clone))
     }
 }
 

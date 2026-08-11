@@ -8,7 +8,6 @@ use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use srh_rs::AppState;
 use srh_rs::adapters::auth_chain::AuthChain;
 use srh_rs::adapters::fred_executor::FredExecutor;
 use srh_rs::adapters::pool_manager::PoolManager;
@@ -17,6 +16,7 @@ use srh_rs::config::Config;
 use srh_rs::domain::rate_limit::RateLimiter;
 use srh_rs::domain::resp::RespValue;
 use srh_rs::ports::{Authenticator, Clock, CommandExecutor, ExecutorProvider, RedisCommand};
+use srh_rs::{AppState, AppStateInner};
 use testcontainers::GenericImage;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -110,13 +110,13 @@ async fn an_allowlisted_eval_is_still_confined_by_the_redis_acl_user() {
     let clock: Arc<dyn Clock> = Arc::new(TestClock);
     let manager = Arc::new(PoolManager::new(Arc::clone(&config), Arc::clone(&clock)));
     let provider: Arc<dyn ExecutorProvider> = manager.clone();
-    let app = srh_rs::http::router(AppState {
+    let app = srh_rs::http::router(AppState::new(AppStateInner {
         provider,
         authenticator: Arc::new(AuthChain::new(vec![static_auth])),
         clock: Arc::clone(&clock),
         rate_limiter: Arc::new(RateLimiter::new(0, clock)),
         cfg: config,
-    });
+    }));
     let response = app
         .oneshot(
             Request::post("/")

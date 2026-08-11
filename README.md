@@ -135,11 +135,13 @@ docker run -d --name srh --restart unless-stopped --network srh-backend \
 The numeric group is the distroless image's `nonroot` group. It lets the non-root process read
 the bind mount without making the credentials world-readable; the `:ro` mount prevents writes.
 
-For a native systemd installation, download and verify the release archive as shown in
-[Artifacts](#artifacts), then install the binary, unit, and configuration:
+For a native systemd installation, download and verify the `x86_64-unknown-linux-gnu` archive
+as shown in [Artifacts](#artifacts), then install the binary, unit, and configuration. Use the
+`x86_64-unknown-linux-musl` archive instead on a host whose glibc is older than the floor
+reported in the release notes:
 
 ```bash
-RELEASE_DIR="srh-rs-v$VERSION-x86_64-unknown-linux-musl"
+RELEASE_DIR="srh-rs-v$VERSION-x86_64-unknown-linux-gnu"
 sudo install -m 0755 "$RELEASE_DIR/srh-rs" /usr/local/bin/srh-rs
 sudo install -m 0644 "$RELEASE_DIR/deploy/srh-rs.service" /etc/systemd/system/srh-rs.service
 sudo install -d -m 0700 /etc/srh-rs
@@ -633,31 +635,38 @@ telemetry headers.
 ### Artifacts
 
 Prebuilt production artifacts are published on the
-[GitHub Releases page](https://github.com/huskercane/srh-rs/releases). Each release contains a
-stripped static `x86_64-unknown-linux-musl` binary archive, its SHA-256 checksum, the README, and
-the hardened systemd unit and example config. For example:
+[GitHub Releases page](https://github.com/huskercane/srh-rs/releases). Each release contains two
+stripped binary archives, each with its SHA-256 checksum, the README, the hardened systemd unit,
+and the example config:
+
+| Archive | Linkage | Use it for |
+| --- | --- | --- |
+| `x86_64-unknown-linux-gnu` | dynamic (glibc) | **systemd hosts.** The faster artifact: this workload spends roughly a tenth of its CPU in the allocator, and glibc's malloc outperforms musl's mallocng under thread contention. |
+| `x86_64-unknown-linux-musl` | fully static | The distroless image, and any host older than the glibc floor printed in the release job summary. |
 
 ```bash
 VERSION=1.0.1
+TARGET=x86_64-unknown-linux-gnu   # or -musl, per the table above
 gh release download "v$VERSION" --repo huskercane/srh-rs \
   --pattern 'srh-rs-*.tar.gz' --pattern 'srh-rs-*.tar.gz.sha256'
-sha256sum --check "srh-rs-v$VERSION-x86_64-unknown-linux-musl.tar.gz.sha256"
-tar -xzf "srh-rs-v$VERSION-x86_64-unknown-linux-musl.tar.gz"
+sha256sum --check "srh-rs-v$VERSION-$TARGET.tar.gz.sha256"
+tar -xzf "srh-rs-v$VERSION-$TARGET.tar.gz"
 ```
 
 The same release is published as a non-root distroless image at
 `ghcr.io/huskercane/srh-rs:v$VERSION`. Pin the digest reported by the release workflow when
 deploying; do not consume a mutable `latest` tag.
 
-The primary native-host artifact is a stripped static musl binary. Install the musl compiler,
-then run the following when building from source:
+Building both artifacts from source needs the musl compiler installed for the static target:
 
 ```bash
 ./scripts/build-artifacts.sh
 ldd target/x86_64-unknown-linux-musl/release/srh-rs
 ```
 
-`ldd` must report `not a dynamic executable`. Build the non-root distroless image with:
+`ldd` must report `not a dynamic executable` for the musl binary; the gnu binary is expected to
+link `libc.so.6`, and the script prints the glibc version it requires. Build the non-root
+distroless image with:
 
 ```bash
 docker build -t srh-rs:local .
@@ -716,9 +725,52 @@ normative 60-second timings. Run the same gate locally with Docker and Python 3:
 For a quick harness check during development, use `PHASE9_SMOKE=1`; it shortens the two load
 profiles but retains every assertion and the configured 64 slow clients.
 
+### Profile before a PR
+
+Unit tests are useful for profiling a specific pure function, but they do not profile the running
+server: most use fakes, bypass the TCP accept loop, and compile with the test profile. For request
+path changes, profile the optimized `srh-rs` binary under the checked-in canonical workload. The
+workload repeatedly executes an authenticated `GET` against a local Redis, uses persistent HTTP
+connections, warms the pools before recording useful samples, and rejects any non-200 response so
+overload behavior cannot accidentally dominate the capture.
+
+On Linux, install `perf`, Docker, Python 3, and `cargo-flamegraph`, then run this before opening a
+performance-sensitive PR:
+
+```bash
+cargo install flamegraph
+./scripts/profile.sh
+```
+
+The script builds the dedicated `profiling` Cargo profile with release optimizations, debug symbols,
+and forced frame pointers; starts an ephemeral Redis; warms every pool; records only the steady-state
+server at 997 Hz for 30 seconds; and writes these ignored artifacts under `target/profiling/`:
+
+- `flamegraph.svg` — interactive CPU flame graph with compiler-expanded inline frames collapsed;
+- `perf-report.txt` — text report suitable for attaching to a PR;
+- `perf.data` — raw capture for follow-up `perf report` queries.
+
+Keep the canonical workload and defaults unchanged when comparing branches. To make a longer capture
+without editing tracked files, set `PROFILE_DURATION` and `PROFILE_CONCURRENCY`:
+
+```bash
+PROFILE_DURATION=60 PROFILE_CONCURRENCY=64 ./scripts/profile.sh
+```
+
+Record the before/after request rate and p99 printed by the workload, and compare the same stacks in
+both flame graphs. Do not commit the generated SVG or `perf.data`; they are host-specific. The regular
+pre-PR correctness gate remains:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+```
+
 ### systemd
 
-Ship as a static `x86_64-unknown-linux-musl` binary with `deploy/srh-rs.service`:
+Ship the `x86_64-unknown-linux-gnu` binary with `deploy/srh-rs.service`, falling back to the
+static `x86_64-unknown-linux-musl` build on hosts below its glibc floor:
 
 ```ini
 [Service]

@@ -10,7 +10,6 @@ use base64::Engine;
 use bytes::Bytes;
 use futures_util::future::join_all;
 use serde_json::Value;
-use srh_rs::AppState;
 use srh_rs::adapters::auth_chain::AuthChain;
 use srh_rs::adapters::fred_executor::FredExecutor;
 use srh_rs::adapters::pool_manager::PoolManager;
@@ -19,6 +18,7 @@ use srh_rs::config::Config;
 use srh_rs::domain::resp::{PoolReadiness, PoolReadinessStatus, RespValue};
 use srh_rs::ports::{Authenticator, Clock, CommandExecutor, ExecutorProvider, RedisCommand};
 use srh_rs::testsupport::executor_contract;
+use srh_rs::{AppState, AppStateInner};
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
@@ -87,7 +87,7 @@ async fn fred_executor_satisfies_contract_and_preserves_binary_values() {
         Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
     let manager = Arc::new(PoolManager::new(Arc::clone(&config), Arc::new(TestClock)));
     let provider: Arc<dyn ExecutorProvider> = manager.clone();
-    let app = srh_rs::http::router(AppState {
+    let app = srh_rs::http::router(AppState::new(AppStateInner {
         provider,
         authenticator: Arc::new(AuthChain::new(vec![static_auth])),
         clock: Arc::new(TestClock),
@@ -96,7 +96,7 @@ async fn fred_executor_satisfies_contract_and_preserves_binary_values() {
             Arc::new(TestClock),
         )),
         cfg: config,
-    });
+    }));
     let response = app
         .clone()
         .oneshot(

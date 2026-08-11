@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use serde_json::{Value, json};
-use srh_rs::AppState;
 use srh_rs::adapters::auth_chain::AuthChain;
 use srh_rs::adapters::static_auth::StaticAuth;
 use srh_rs::config::Config;
@@ -14,6 +13,7 @@ use srh_rs::http;
 use srh_rs::ports::{
     Authenticator, Clock, CommandExecutor, ExecutorHandle, ExecutorProvider, RedisCommand,
 };
+use srh_rs::{AppState, AppStateInner};
 use tower::ServiceExt;
 
 struct FixedExecutor {
@@ -89,7 +89,7 @@ fn app_with_auth(
     config: Arc<Config>,
     result: Result<RespValue, ExecError>,
 ) -> axum::Router {
-    http::router(AppState {
+    http::router(AppState::new(AppStateInner {
         provider: Arc::new(FixedProvider {
             executor: Arc::new(FixedExecutor { result }),
         }),
@@ -100,7 +100,7 @@ fn app_with_auth(
             Arc::new(TestClock),
         )),
         cfg: config,
-    })
+    }))
 }
 
 async fn response_json(response: axum::response::Response) -> Value {
@@ -291,7 +291,7 @@ impl Authenticator for UnavailableAuth {
     async fn authenticate(
         &self,
         _bearer: &str,
-    ) -> Result<Option<srh_rs::domain::identity::Identity>, srh_rs::domain::identity::AuthError>
+    ) -> Result<Option<Arc<srh_rs::domain::identity::Identity>>, srh_rs::domain::identity::AuthError>
     {
         Err(srh_rs::domain::identity::AuthError::ServiceUnavailable(
             "introspection endpoint unreachable".to_owned(),

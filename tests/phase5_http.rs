@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use serde_json::{Value, json};
-use srh_rs::AppState;
 use srh_rs::adapters::auth_chain::AuthChain;
 use srh_rs::adapters::static_auth::StaticAuth;
 use srh_rs::config::Config;
@@ -16,6 +15,7 @@ use srh_rs::domain::resp::{AcquireError, ExecError, PoolReadiness, RespValue};
 use srh_rs::ports::{
     Authenticator, Clock, CommandExecutor, ExecutorHandle, ExecutorProvider, RedisCommand,
 };
+use srh_rs::{AppState, AppStateInner};
 use tower::ServiceExt;
 
 #[derive(Default)]
@@ -131,13 +131,13 @@ fn app(config: Value) -> (axum::Router, Arc<RecordingProvider>, Arc<ManualClock>
         config.server.rate_limit.per_token_commands_per_sec,
         Arc::clone(&clock_port),
     ));
-    let router = srh_rs::http::router(AppState {
+    let router = srh_rs::http::router(AppState::new(AppStateInner {
         provider: provider.clone(),
         authenticator: Arc::new(AuthChain::new(vec![auth])),
         clock: clock_port,
         rate_limiter,
         cfg: config,
-    });
+    }));
     (router, provider, clock)
 }
 

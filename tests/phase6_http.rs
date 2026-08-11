@@ -9,7 +9,6 @@ use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::{Value, json};
-use srh_rs::AppState;
 use srh_rs::adapters::auth_chain::AuthChain;
 use srh_rs::adapters::jwt_auth::JwtAuth;
 use srh_rs::adapters::static_auth::StaticAuth;
@@ -21,6 +20,7 @@ use srh_rs::ports::{
     Authenticator, Clock, CommandExecutor, ExecutorHandle, ExecutorProvider, Introspector,
     JwksSource, RedisCommand,
 };
+use srh_rs::{AppState, AppStateInner};
 use tower::ServiceExt;
 
 const PRIVATE_KEY: &[u8] = include_bytes!("fixtures/rsa_private.pem");
@@ -123,13 +123,13 @@ fn app(introspector: Option<Arc<dyn Introspector>>) -> axum::Router {
     ));
     let static_auth: Arc<dyn Authenticator> =
         Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
-    srh_rs::http::router(AppState {
+    srh_rs::http::router(AppState::new(AppStateInner {
         provider: Arc::new(Provider),
         authenticator: Arc::new(AuthChain::new(vec![jwt, static_auth])),
         clock: Arc::clone(&clock),
         rate_limiter: Arc::new(RateLimiter::new(0, clock)),
         cfg: config,
-    })
+    }))
 }
 
 fn jwt(roles: &[&str]) -> String {
