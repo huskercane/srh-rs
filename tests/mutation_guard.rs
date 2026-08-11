@@ -203,8 +203,8 @@ fn mutations(root: &Path) -> Vec<Mutation> {
     all.push(mutation(
         "acl-name-not-uppercased",
         ACL,
-        "        .to_ascii_uppercase();",
-        "        .to_owned();",
+        "    let name = name.to_ascii_uppercase();",
+        "    let name = name.to_owned();",
         Expectation::Killed,
     ));
     all.push(mutation(
@@ -235,15 +235,15 @@ fn mutations(root: &Path) -> Vec<Mutation> {
     all.push(mutation(
         "xread-block-guard-case-sensitive",
         ACL,
-        "argument.eq_ignore_ascii_case(\"BLOCK\")",
-        "argument == \"BLOCK\"",
+        "argument.as_ref().eq_ignore_ascii_case(b\"BLOCK\")",
+        "argument.as_ref() == b\"BLOCK\"",
         Expectation::Killed,
     ));
     all.push(mutation(
         "admin-gate-becomes-grant",
         ACL,
-        "    let admin_allowed = identity.is_admin && admin_allow(&name, command.get(1));",
-        "    let admin_allowed = identity.is_admin && admin_allow(&name, command.get(1));\n    if admin_allowed { return Ok(()); }",
+        "    let admin_allowed = identity.is_admin && admin_allow(&name, command.args.first());",
+        "    let admin_allowed = identity.is_admin && admin_allow(&name, command.args.first());\n    if admin_allowed { return Ok(()); }",
         Expectation::Killed,
     ));
     all.push(mutation(
@@ -279,22 +279,29 @@ fn mutations(root: &Path) -> Vec<Mutation> {
     all.push(mutation(
         "rate-bound-removed",
         RATE_LIMIT,
-        "        if buckets.entries.len() >= self.max_buckets && evict_one(buckets) {\n            self.debt_forgiven_evictions.fetch_add(1, Ordering::Relaxed);\n        }\n",
+        "        if entries.len() >= self.max_buckets && evict_one(entries, lru) {\n            self.debt_forgiven_evictions.fetch_add(1, Ordering::Relaxed);\n        }\n",
         "",
         Expectation::Killed,
     ));
     all.push(mutation(
         "evict-prefers-debt",
         RATE_LIMIT,
-        "if let Some(candidate) = buckets.credit_lru.pop_first()",
-        "if let Some(candidate) = buckets.debt_lru.pop_first()",
+        "if let Some(candidate) = lru.credit.pop_first()",
+        "if let Some(candidate) = lru.debt.pop_first()",
         Expectation::Killed,
     ));
     all.push(mutation(
         "rate-no-debt",
         RATE_LIMIT,
-        "        let result = if bucket.balance <= 0.0 {\n            Err(self.exceeded(bucket.balance))\n        } else {\n            bucket.balance -= command_count.max(1) as f64;",
-        "        let result = if bucket.balance < command_count.max(1) as f64 {\n            Err(self.exceeded(bucket.balance))\n        } else {\n            bucket.balance -= command_count.max(1) as f64;",
+        "        if bucket.balance <= 0.0 {\n            return Err(self.exceeded(bucket.balance));\n        }",
+        "        if let Access::Charge(command_count) = access\n            && bucket.balance < command_count.max(1) as f64\n        {\n            return Err(self.exceeded(bucket.balance));\n        }\n        if bucket.balance <= 0.0 {\n            return Err(self.exceeded(bucket.balance));\n        }",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "rate-unlinks-from-the-wrong-index",
+        RATE_LIMIT,
+        "    fn unlink(&mut self, bucket: &Bucket) {\n        if bucket.indebted {",
+        "    fn unlink(&mut self, bucket: &Bucket) {\n        if false {",
         Expectation::Killed,
     ));
     all.push(mutation(
@@ -316,29 +323,29 @@ fn mutations(root: &Path) -> Vec<Mutation> {
     all.push(mutation(
         "single-acl-after-acquire",
         COMMAND,
-        "    crate::domain::acl::check(&identity.0, &values)?;\n    let command = crate::domain::compat::normalize(json_args_to_redis(&values)?);\n    let handle = state\n        .provider\n        .acquire(&identity.0.pool)\n        .await\n        .map_err(|error| map_acquire_error(error, &state))?;",
-        "    let command = crate::domain::compat::normalize(json_args_to_redis(&values)?);\n    let handle = state\n        .provider\n        .acquire(&identity.0.pool)\n        .await\n        .map_err(|error| map_acquire_error(error, &state))?;\n    crate::domain::acl::check(&identity.0, &values)?;",
+        "    crate::domain::acl::check(&identity.0, &command)?;\n    let command = crate::domain::compat::normalize(command);\n    let handle = state\n        .provider\n        .acquire(&identity.0.pool)\n        .await\n        .map_err(|error| map_acquire_error(error, &state))?;",
+        "    let command = crate::domain::compat::normalize(command);\n    let handle = state\n        .provider\n        .acquire(&identity.0.pool)\n        .await\n        .map_err(|error| map_acquire_error(error, &state))?;\n    crate::domain::acl::check(&identity.0, &command)?;",
         Expectation::Killed,
     ));
     all.push(mutation(
         "multi-exec-acl-removed",
         MULTI_EXEC,
-        "    for command in &values {\n        crate::domain::acl::check(&identity.0, command)?;\n    }\n",
+        "    for command in &commands {\n        crate::domain::acl::check(&identity.0, command)?;\n    }\n",
         "",
         Expectation::Killed,
     ));
     all.push(mutation(
         "multi-exec-runtime-error-result-dropped",
         MULTI_EXEC,
-        "            Err(ExecError::Redis(message)) => Ok(json!({ \"error\": message })),",
-        "            Err(ExecError::Redis(message)) => Ok(json!({ \"result\": message })),",
+        "            Err(ExecError::Redis(message)) => Ok(Slot::Error(message)),",
+        "            Err(ExecError::Redis(message)) => Ok(Slot::Result {\n                value: crate::domain::resp::RespValue::Simple(message),\n                encoding,\n            }),",
         Expectation::Killed,
     ));
     all.push(mutation(
         "pipeline-sends-denied",
         PIPELINE,
-        "            Err(crate::domain::acl::AclError::Forbidden(message)) => {\n                slots.push(Some(json!({ \"error\": message })));\n            }",
-        "            Err(crate::domain::acl::AclError::Forbidden(_)) => {\n                allowed_commands.push(json_args_to_redis(command)?);\n                slots.push(None);\n            }",
+        "            Err(crate::domain::acl::AclError::Forbidden(message)) => {\n                slots.push(Some(Slot::Error(message)));\n            }",
+        "            Err(crate::domain::acl::AclError::Forbidden(_)) => {\n                allowed_commands.push(crate::domain::compat::normalize(command));\n                slots.push(None);\n            }",
         Expectation::Killed,
     ));
     all.push(mutation(
@@ -353,22 +360,22 @@ fn mutations(root: &Path) -> Vec<Mutation> {
     all.push(mutation(
         "single-charge-removed",
         COMMAND,
-        "    audit.command(values.first().and_then(serde_json::Value::as_str), 1);\n    charge_rate_limit(&state, &identity.0.bucket_key, 1)?;\n    crate::domain::acl::check",
-        "    audit.command(values.first().and_then(serde_json::Value::as_str), 1);\n    crate::domain::acl::check",
+        "    audit.command(Some(command.name.as_str()), 1);\n    charge_rate_limit(&state, &identity.0.bucket_key, 1)?;\n    crate::domain::acl::check",
+        "    audit.command(Some(command.name.as_str()), 1);\n    crate::domain::acl::check",
         Expectation::Killed,
     ));
     all.push(mutation(
         "multi-exec-charge-is-one",
         MULTI_EXEC,
-        "charge_rate_limit(&state, &identity.0.bucket_key, values.len())?;",
+        "charge_rate_limit(&state, &identity.0.bucket_key, commands.len())?;",
         "charge_rate_limit(&state, &identity.0.bucket_key, 1)?;",
         Expectation::Killed,
     ));
     all.push(mutation(
         "empty-multiexec-charge-removed",
         MULTI_EXEC,
-        "    if values.is_empty() {\n        charge_rate_limit(&state, &identity.0.bucket_key, 1)?;\n",
-        "    if values.is_empty() {\n",
+        "    if commands.is_empty() {\n        charge_rate_limit(&state, &identity.0.bucket_key, 1)?;\n",
+        "    if commands.is_empty() {\n",
         Expectation::Killed,
     ));
     for (name, file) in [
@@ -633,15 +640,29 @@ fn mutations(root: &Path) -> Vec<Mutation> {
     all.push(mutation(
         "audit-subject-omitted",
         OBSERVABILITY,
-        "        subject = fields.subject.as_deref().unwrap_or(\"-\"),",
+        "        subject = fields\n            .identity\n            .as_ref()\n            .map_or(\"-\", |identity| identity.subject.as_str()),",
         "        subject = \"-\",",
         Expectation::Killed,
     ));
     all.push(mutation(
         "endpoint-label-cardinality-unbounded",
         OBSERVABILITY,
-        "        _ => \"other\",",
-        "        _ => \"/\",",
+        "        \"/ready\" => \"/ready\",\n        _ => \"other\",",
+        "        \"/ready\" => \"/ready\",\n        _ => \"/\",",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "status-label-cardinality-unbounded",
+        OBSERVABILITY,
+        "        503 => \"503\",\n        _ => \"other\",",
+        "        503 => \"503\",\n        _ => \"418\",",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "in-flight-gauge-leaks-on-abandoned-request",
+        OBSERVABILITY,
+        "impl Drop for InFlight {\n    fn drop(&mut self) {\n        metrics::gauge!(\"srh_http_in_flight\").decrement(1.0);\n    }\n}",
+        "impl Drop for InFlight {\n    fn drop(&mut self) {}\n}",
         Expectation::Killed,
     ));
     all.push(mutation(
@@ -675,10 +696,38 @@ fn mutations(root: &Path) -> Vec<Mutation> {
         Expectation::Killed,
     ));
     all.push(mutation(
-        "trace-layer-amplifies-shed-logs",
+        "audit-middleware-unmounted",
         HTTP_MOD,
-        "TraceLayer::new_for_http().on_failure(())",
-        "TraceLayer::new_for_http()",
+        "        .layer(observability::ObserveLayer)\n",
+        "",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "response-budget-uncharged-single",
+        COMMAND,
+        "    charge_response_budget(&value, encoding, &mut budget)?;\n",
+        "",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "response-budget-uncharged-pipeline",
+        PIPELINE,
+        "                charge_response_budget(&value, encoding, &mut budget)?;\n",
+        "",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "healthy-probe-audited",
+        OBSERVABILITY,
+        "    if is_probe(endpoint) && (200..300).contains(&status) {\n        return;\n    }\n",
+        "",
+        Expectation::Killed,
+    ));
+    all.push(mutation(
+        "failing-probe-not-audited",
+        OBSERVABILITY,
+        "    if is_probe(endpoint) && (200..300).contains(&status) {",
+        "    if is_probe(endpoint) {",
         Expectation::Killed,
     ));
     all.push(mutation(

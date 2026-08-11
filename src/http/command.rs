@@ -5,10 +5,9 @@ use axum::body::to_bytes;
 use axum::extract::{Extension, Request, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
-use serde_json::json;
 
 use crate::AppState;
-use crate::domain::convert::{Encoding, json_args_to_redis, redis_value_to_json};
+use crate::domain::convert::{Encoding, ResponseJson, charge_response_budget};
 use crate::domain::resp::{AcquireError, ExecError};
 use crate::error::AppError;
 use crate::http::extractors::AuthedIdentity;
@@ -22,8 +21,8 @@ pub async fn execute(
 ) -> Result<Response, AppError> {
     audit.identity(&identity.0);
     let body = read_body(&state, request).await?;
-    let values = match super::parse::command(&body, state.cfg.server.max_request_elements) {
-        Ok(values) => values,
+    let command = match super::parse::command(&body, state.cfg.server.max_request_elements) {
+        Ok(command) => command,
         Err(error) => {
             // An invalid request still consumed a bounded parse. Charging the minimum cost makes
             // repeated garbage reach the pre-parse shed instead of buying unlimited parsing.
@@ -38,10 +37,10 @@ pub async fn execute(
             });
         }
     };
-    audit.command(values.first().and_then(serde_json::Value::as_str), 1);
+    audit.command(Some(command.name.as_str()), 1);
     charge_rate_limit(&state, &identity.0.bucket_key, 1)?;
-    crate::domain::acl::check(&identity.0, &values)?;
-    let command = crate::domain::compat::normalize(json_args_to_redis(&values)?);
+    crate::domain::acl::check(&identity.0, &command)?;
+    let command = crate::domain::compat::normalize(command);
     let handle = state
         .provider
         .acquire(&identity.0.pool)
@@ -52,8 +51,51 @@ pub async fn execute(
         .await
         .map_err(|error| map_exec_error(error, &state))?;
     let mut budget = state.cfg.server.load.max_response_bytes;
-    let value = redis_value_to_json(value, response_encoding(&headers), &mut budget)?;
-    Ok(Json(json!({ "result": value })).into_response())
+    let encoding = response_encoding(&headers);
+    // The budget is charged in full before anything is written, so an oversized reply
+    // fails the request rather than truncating a response already committed to.
+    charge_response_budget(&value, encoding, &mut budget)?;
+    Ok(Json(Envelope {
+        result: ResponseJson::new(&value, encoding),
+    })
+    .into_response())
+}
+
+/// The `{"result": ...}` wrapper for a single command.
+#[derive(serde::Serialize)]
+struct Envelope<T> {
+    result: T,
+}
+
+/// One `{"result": ...}` or `{"error": ...}` entry of a pipeline or transaction response.
+///
+/// Holding the RESP value and rendering it at serialization time is what keeps the
+/// response off the `serde_json::Value` path; the slot is built only once the value has
+/// been charged against the shared response budget.
+pub(super) enum Slot {
+    Result {
+        value: crate::domain::resp::RespValue,
+        encoding: Encoding,
+    },
+    Error(String),
+}
+
+impl serde::Serialize for Slot {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut entry = serializer.serialize_map(Some(1))?;
+        match self {
+            Self::Result { value, encoding } => {
+                entry.serialize_entry("result", &ResponseJson::new(value, *encoding))?;
+            }
+            Self::Error(message) => entry.serialize_entry("error", message)?,
+        }
+        entry.end()
+    }
 }
 
 pub(super) fn charge_rate_limit(

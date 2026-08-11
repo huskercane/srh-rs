@@ -4,14 +4,12 @@ use axum::BoxError;
 use axum::Router;
 use axum::error_handling::HandleErrorLayer;
 use axum::http::StatusCode;
-use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use serde_json::json;
 use tower::ServiceBuilder;
 use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::limit::RequestBodyLimitLayer;
-use tower_http::trace::TraceLayer;
 
 use crate::AppState;
 use crate::error::AppError;
@@ -40,11 +38,15 @@ pub fn router(state: AppState) -> Router {
         .method_not_allowed_fallback(method_not_allowed);
     api.merge(observability)
         .fallback(not_found)
-        .layer(middleware::from_fn(observability::observe_request))
-        // The structured audit middleware emits the one canonical completion event. The
-        // TraceLayer still supplies request spans, but its default failure callback logs every
-        // shed 503 at ERROR and can turn deliberate overload into a log-amplification attack.
-        .layer(TraceLayer::new_for_http().on_failure(()))
+        // `ObserveLayer` emits the one canonical completion event. There is deliberately no
+        // `TraceLayer` beside it: every part of it is DEBUG-level (`DefaultMakeSpan` and
+        // `DEFAULT_MESSAGE_LEVEL` are both `Level::DEBUG`) and its ERROR failure callback was
+        // already disabled here, because logging every shed 503 at ERROR turns deliberate
+        // overload into log amplification. At the production filter it therefore emitted
+        // nothing at all — not even span context, since a filtered-out span carries none —
+        // while costing 8.1k cycles per request, 11% of the total. Measured with
+        // `scripts/profile-inproc.sh`; re-measure before adding a layer back.
+        .layer(observability::ObserveLayer)
         .with_state(state)
 }
 

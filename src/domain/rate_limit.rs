@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,21 +13,70 @@ pub struct RateLimitExceeded {
     pub retry_after_secs: u64,
 }
 
+/// One credential's token balance.
+///
+/// `key` is a second handle to the map key, so re-indexing a bucket for recency costs a
+/// refcount bump instead of a key clone: the credential digest is allocated once and
+/// shared by the map entry, the bucket, and the LRU index.
 struct Bucket {
     balance: f64,
     updated: Instant,
     last_access: Instant,
     order: u64,
+    key: Arc<str>,
+    /// Which index currently holds `order`. Recorded when the bucket is linked rather
+    /// than derived from `balance` on read, so an in-place refill can never unlink from
+    /// the wrong index.
+    indebted: bool,
 }
 
-type LruKey = (Instant, u64, String);
+/// Recency index over bucket keys, split so eviction can prefer non-indebted identities.
+///
+/// Ordering is by `order`, a monotonic access counter. That is the same ordering the
+/// previous `(last_access, order)` composite key produced — `last_access` is set to `now`
+/// on the very access that assigns `order`, so the two agree on every pair — but a `u64`
+/// key is `Copy`, which is what removes the per-access key clone and the string
+/// comparisons from the critical section.
+#[derive(Default)]
+struct Lru {
+    credit: BTreeMap<u64, Arc<str>>,
+    debt: BTreeMap<u64, Arc<str>>,
+    next_order: u64,
+}
+
+impl Lru {
+    fn unlink(&mut self, bucket: &Bucket) {
+        if bucket.indebted {
+            self.debt.remove(&bucket.order);
+        } else {
+            self.credit.remove(&bucket.order);
+        }
+    }
+
+    fn link(&mut self, bucket: &mut Bucket) {
+        bucket.order = self.next_order;
+        self.next_order = self.next_order.wrapping_add(1);
+        bucket.indebted = bucket.balance < 0.0;
+        let index = if bucket.indebted {
+            &mut self.debt
+        } else {
+            &mut self.credit
+        };
+        index.insert(bucket.order, Arc::clone(&bucket.key));
+    }
+}
 
 #[derive(Default)]
 struct Buckets {
-    entries: HashMap<String, Bucket>,
-    credit_lru: BTreeSet<LruKey>,
-    debt_lru: BTreeSet<LruKey>,
-    next_order: u64,
+    entries: HashMap<Arc<str>, Bucket>,
+    lru: Lru,
+}
+
+/// What an admitted access does to the balance.
+#[derive(Clone, Copy)]
+enum Access {
+    Probe,
+    Charge(usize),
 }
 
 pub struct RateLimiter {
@@ -58,77 +107,107 @@ impl RateLimiter {
 
     /// Rejects an already-indebted identity without charging it.
     pub fn probe(&self, key: &str) -> Result<(), RateLimitExceeded> {
-        if self.rate == 0 {
-            return Ok(());
-        }
-        let now = self.clock.instant();
-        let mut buckets = self
-            .buckets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut bucket = self.take_bucket(&mut buckets, key, now);
-        refill(&mut bucket, now, self.rate, self.capacity);
-        bucket.last_access = now;
-        let result = if bucket.balance <= 0.0 {
-            Err(self.exceeded(bucket.balance))
-        } else {
-            Ok(())
-        };
-        finish_access(&mut buckets, key, bucket);
-        result
+        self.access(key, Access::Probe)
     }
 
     /// Charges a parsed request in full whenever its balance is positive before charging.
     pub fn charge(&self, key: &str, command_count: usize) -> Result<(), RateLimitExceeded> {
+        self.access(key, Access::Charge(command_count))
+    }
+
+    /// Admits or rejects one access, updating the bucket in place.
+    ///
+    /// This is the whole per-request cost of rate limiting, and it runs twice per request
+    /// under one global lock, so the length of this critical section — not its throughput
+    /// in isolation — is what bounds concurrency for a single hot credential. It is one
+    /// hash lookup plus two `u64`-keyed index operations, and it allocates only when a
+    /// credential is seen for the first time.
+    fn access(&self, key: &str, access: Access) -> Result<(), RateLimitExceeded> {
         if self.rate == 0 {
             return Ok(());
         }
         let now = self.clock.instant();
-        let mut buckets = self
+        let mut guard = self
             .buckets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut bucket = self.take_bucket(&mut buckets, key, now);
-        refill(&mut bucket, now, self.rate, self.capacity);
-        bucket.last_access = now;
-        let result = if bucket.balance <= 0.0 {
-            Err(self.exceeded(bucket.balance))
-        } else {
-            bucket.balance -= command_count.max(1) as f64;
-            Ok(())
+        let Buckets { entries, lru } = &mut *guard;
+        if let Some(bucket) = entries.get_mut(key) {
+            // Unlink before refilling: `indebted` describes where `order` is indexed
+            // right now, and refilling may change which index the bucket belongs in.
+            lru.unlink(bucket);
+            refill(bucket, now, self.rate, self.capacity);
+            bucket.last_access = now;
+            let result = self.settle(bucket, access);
+            lru.link(bucket);
+            return result;
+        }
+        if entries.len() >= self.max_buckets && evict_one(entries, lru) {
+            self.debt_forgiven_evictions.fetch_add(1, Ordering::Relaxed);
+        }
+        let key = Arc::<str>::from(key);
+        // A bucket created at `now` has nothing to refill and is in no index yet.
+        let mut bucket = Bucket {
+            balance: self.capacity,
+            updated: now,
+            last_access: now,
+            order: 0,
+            key: Arc::clone(&key),
+            indebted: false,
         };
-        finish_access(&mut buckets, key, bucket);
+        let result = self.settle(&mut bucket, access);
+        lru.link(&mut bucket);
+        entries.insert(key, bucket);
         result
     }
 
+    fn settle(&self, bucket: &mut Bucket, access: Access) -> Result<(), RateLimitExceeded> {
+        if bucket.balance <= 0.0 {
+            return Err(self.exceeded(bucket.balance));
+        }
+        if let Access::Charge(command_count) = access {
+            bucket.balance -= command_count.max(1) as f64;
+        }
+        Ok(())
+    }
+
     /// Evicts non-indebted buckets that have been idle for at least fifteen minutes.
+    ///
+    /// Runs from pool maintenance once a minute, so it stays a full scan; only the
+    /// per-request path above is on the hot path.
     pub fn sweep_idle(&self) -> usize {
         if self.rate == 0 {
             return 0;
         }
         let now = self.clock.instant();
-        let mut buckets = self
+        let mut guard = self
             .buckets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let keys = buckets.entries.keys().cloned().collect::<Vec<_>>();
-        let mut evicted = 0;
-        for key in keys {
-            let Some(mut bucket) = buckets.entries.remove(&key) else {
-                continue;
-            };
-            remove_order(&mut buckets, &key, &bucket);
-            refill(&mut bucket, now, self.rate, self.capacity);
+        let Buckets { entries, lru } = &mut *guard;
+        let mut idle = Vec::new();
+        for (key, bucket) in entries.iter_mut() {
+            refill(bucket, now, self.rate, self.capacity);
+            // Refilling can lift a bucket out of debt with no access of its own, so
+            // re-index it before deciding: an identity that repaid its debt by waiting is
+            // an ordinary idle bucket again.
+            if bucket.indebted && bucket.balance >= 0.0 {
+                lru.debt.remove(&bucket.order);
+                lru.credit.insert(bucket.order, Arc::clone(key));
+                bucket.indebted = false;
+            }
             if bucket.balance >= 0.0
                 && now.saturating_duration_since(bucket.last_access) >= IDLE_EVICTION
             {
-                evicted += 1;
-            } else {
-                insert_order(&mut buckets, &key, &bucket);
-                buckets.entries.insert(key, bucket);
+                idle.push(Arc::clone(key));
             }
         }
-        evicted
+        for key in &idle {
+            if let Some(bucket) = entries.remove(key) {
+                lru.unlink(&bucket);
+            }
+        }
+        idle.len()
     }
 
     /// Returns the number of currently retained identity buckets.
@@ -145,22 +224,6 @@ impl RateLimiter {
         self.debt_forgiven_evictions.swap(0, Ordering::AcqRel)
     }
 
-    fn take_bucket(&self, buckets: &mut Buckets, key: &str, now: Instant) -> Bucket {
-        if let Some(bucket) = buckets.entries.remove(key) {
-            remove_order(buckets, key, &bucket);
-            return bucket;
-        }
-        if buckets.entries.len() >= self.max_buckets && evict_one(buckets) {
-            self.debt_forgiven_evictions.fetch_add(1, Ordering::Relaxed);
-        }
-        Bucket {
-            balance: self.capacity,
-            updated: now,
-            last_access: now,
-            order: 0,
-        }
-    }
-
     fn exceeded(&self, balance: f64) -> RateLimitExceeded {
         let deficit = (-balance).max(0.0);
         RateLimitExceeded {
@@ -175,45 +238,16 @@ fn refill(bucket: &mut Bucket, now: Instant, rate: u64, capacity: f64) {
     bucket.updated = now;
 }
 
-fn finish_access(buckets: &mut Buckets, key: &str, mut bucket: Bucket) {
-    bucket.order = buckets.next_order;
-    buckets.next_order = buckets.next_order.wrapping_add(1);
-    insert_order(buckets, key, &bucket);
-    buckets.entries.insert(key.to_owned(), bucket);
-}
-
-fn order_key(key: &str, bucket: &Bucket) -> LruKey {
-    (bucket.last_access, bucket.order, key.to_owned())
-}
-
-fn insert_order(buckets: &mut Buckets, key: &str, bucket: &Bucket) {
-    let index = if bucket.balance < 0.0 {
-        &mut buckets.debt_lru
-    } else {
-        &mut buckets.credit_lru
-    };
-    index.insert(order_key(key, bucket));
-}
-
-fn remove_order(buckets: &mut Buckets, key: &str, bucket: &Bucket) {
-    let index = if bucket.balance < 0.0 {
-        &mut buckets.debt_lru
-    } else {
-        &mut buckets.credit_lru
-    };
-    index.remove(&order_key(key, bucket));
-}
-
-fn evict_one(buckets: &mut Buckets) -> bool {
-    let (candidate, forgave_debt) = if let Some(candidate) = buckets.credit_lru.pop_first() {
+fn evict_one(entries: &mut HashMap<Arc<str>, Bucket>, lru: &mut Lru) -> bool {
+    let (candidate, forgave_debt) = if let Some(candidate) = lru.credit.pop_first() {
         (Some(candidate), false)
     } else {
         // At the hard bound, all retained identities may be indebted. Forgiving the oldest debt
         // is the deliberate bounded-memory fallback; normal idle sweeping never forgives debt.
-        (buckets.debt_lru.pop_first(), true)
+        (lru.debt.pop_first(), true)
     };
-    if let Some((_, _, key)) = candidate {
-        buckets.entries.remove(&key);
+    if let Some((_, key)) = candidate {
+        entries.remove(&key);
         forgave_debt
     } else {
         false
@@ -346,6 +380,61 @@ mod tests {
         let buckets = limiter.buckets.lock().unwrap();
         assert!(!buckets.entries.contains_key("credit"));
         assert!(buckets.entries.contains_key("debt"));
+    }
+
+    #[test]
+    fn a_debt_repaid_by_idling_is_swept_and_leaves_no_stale_index_entry() {
+        let (limiter, clock) = limiter(1);
+        // Deliberately a small debt: unlike the live-debt case above, fifteen minutes of
+        // refill clears it, so the sweep must move the bucket out of the debt index
+        // before evicting it.
+        limiter.charge("repaid", 5).unwrap();
+        {
+            let buckets = limiter.buckets.lock().unwrap();
+            assert_eq!(buckets.lru.debt.len(), 1, "the bucket starts indebted");
+        }
+        clock.advance(Duration::from_secs(901));
+
+        assert_eq!(limiter.sweep_idle(), 1);
+        let buckets = limiter.buckets.lock().unwrap();
+        assert!(buckets.entries.is_empty());
+        assert!(
+            buckets.lru.credit.is_empty() && buckets.lru.debt.is_empty(),
+            "eviction must unlink from whichever index the refill left the bucket in"
+        );
+    }
+
+    #[test]
+    fn every_retained_bucket_is_indexed_exactly_once() {
+        let (limiter, clock) = limiter(10);
+        // Drives buckets back and forth across the credit/debt boundary: an unlink from
+        // the wrong index orphans an entry, which would silently break eviction.
+        for round in 0..4 {
+            for name in ["a", "b", "c"] {
+                let _ = limiter.probe(name);
+                let _ = limiter.charge(name, round * 9 + 1);
+            }
+            clock.advance(Duration::from_millis(400));
+        }
+
+        let buckets = limiter.buckets.lock().unwrap();
+        assert_eq!(
+            buckets.lru.credit.len() + buckets.lru.debt.len(),
+            buckets.entries.len(),
+            "index entries must not be orphaned or duplicated"
+        );
+        for bucket in buckets.entries.values() {
+            let index = if bucket.indebted {
+                &buckets.lru.debt
+            } else {
+                &buckets.lru.credit
+            };
+            assert_eq!(
+                index.get(&bucket.order).map(AsRef::as_ref),
+                Some(&*bucket.key),
+                "a bucket must be indexed under the list its recorded state names"
+            );
+        }
     }
 
     #[test]

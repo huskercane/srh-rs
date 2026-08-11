@@ -2,14 +2,13 @@ use axum::Json;
 use axum::extract::{Extension, Request, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
-use serde_json::json;
 
 use crate::AppState;
-use crate::domain::convert::{json_args_to_redis, redis_value_to_json};
+use crate::domain::convert::charge_response_budget;
 use crate::domain::resp::ExecError;
 use crate::error::AppError;
 use crate::http::command::{
-    charge_rate_limit, map_acquire_error, map_exec_error, response_encoding,
+    Slot, charge_rate_limit, map_acquire_error, map_exec_error, response_encoding,
 };
 use crate::http::extractors::AuthedIdentity;
 
@@ -22,12 +21,12 @@ pub async fn execute(
 ) -> Result<Response, AppError> {
     audit.identity(&identity.0);
     let body = super::command::read_body(&state, request).await?;
-    let values = match super::parse::pipeline(
+    let commands = match super::parse::pipeline(
         &body,
         state.cfg.server.max_pipeline_commands,
         state.cfg.server.max_request_elements,
     ) {
-        Ok(values) => values,
+        Ok(commands) => commands,
         Err(error) => {
             charge_rate_limit(&state, &identity.0.bucket_key, 1)?;
             return Err(match error {
@@ -43,19 +42,19 @@ pub async fn execute(
             });
         }
     };
-    audit.command(Some("MULTI-EXEC"), values.len());
-    if values.is_empty() {
+    audit.command(Some("MULTI-EXEC"), commands.len());
+    if commands.is_empty() {
         charge_rate_limit(&state, &identity.0.bucket_key, 1)?;
         return Err(AppError::BadRequest("Invalid command".to_owned()));
     }
-    charge_rate_limit(&state, &identity.0.bucket_key, values.len())?;
-    for command in &values {
+    charge_rate_limit(&state, &identity.0.bucket_key, commands.len())?;
+    for command in &commands {
         crate::domain::acl::check(&identity.0, command)?;
     }
-    let commands = values
-        .iter()
-        .map(|values| json_args_to_redis(values).map(crate::domain::compat::normalize))
-        .collect::<Result<Vec<_>, _>>()?;
+    let commands = commands
+        .into_iter()
+        .map(crate::domain::compat::normalize)
+        .collect::<Vec<_>>();
     let handle = state
         .provider
         .acquire(&identity.0.pool)
@@ -70,17 +69,20 @@ pub async fn execute(
     let response = results
         .into_iter()
         .map(|result| match result {
-            Ok(value) => redis_value_to_json(value, encoding, &mut budget)
-                .map(|value| json!({ "result": value }))
-                .map_err(AppError::from),
-            Err(ExecError::Redis(message)) => Ok(json!({ "error": message })),
+            Ok(value) => {
+                // Charged before the slot is built so the shared budget still fails the
+                // whole request, as it did when each value was converted eagerly.
+                charge_response_budget(&value, encoding, &mut budget)?;
+                Ok(Slot::Result { value, encoding })
+            }
+            Err(ExecError::Redis(message)) => Ok(Slot::Error(message)),
             Err(ExecError::ResponseTooLarge) => Err(AppError::ResponseTooLarge),
-            Err(ExecError::Timeout) => Ok(json!({ "error": "Redis command timed out" })),
+            Err(ExecError::Timeout) => Ok(Slot::Error("Redis command timed out".to_owned())),
             Err(ExecError::Transport(message)) => {
                 tracing::error!(error = %message, "transaction command transport failure");
-                Ok(json!({ "error": "Internal server error" }))
+                Ok(Slot::Error("Internal server error".to_owned()))
             }
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, AppError>>()?;
     Ok(Json(response).into_response())
 }

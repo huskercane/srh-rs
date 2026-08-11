@@ -758,8 +758,38 @@ PROFILE_DURATION=60 PROFILE_CONCURRENCY=64 ./scripts/profile.sh
 ```
 
 Record the before/after request rate and p99 printed by the workload, and compare the same stacks in
-both flame graphs. Do not commit the generated SVG or `perf.data`; they are host-specific. The regular
-pre-PR correctness gate remains:
+both flame graphs. Do not commit the generated SVG or `perf.data`; they are host-specific.
+
+#### Profiling without the network stack
+
+`profile.sh` measures the deployed shape, and roughly a third of its samples land in the kernel:
+loopback TCP for the client hop, loopback TCP for the Redis hop, and the syscalls around both. That
+cost is real, but it is not ours, and at that ratio it hides the code we can actually change.
+
+`./scripts/profile-inproc.sh` runs the same Hyper + Axum + domain stack over an in-memory
+`tokio::io::duplex` transport against a constant-reply executor. No sockets, no Redis, ~4% kernel.
+It is the microscope for proxy CPU and allocation cost; `profile.sh` remains the end-to-end number,
+and throughput between the two is not comparable.
+
+```bash
+./scripts/profile-inproc.sh                                     # canonical small GET
+./scripts/profile-inproc.sh --path /pipeline --body '[["GET","load:key"],["GET","load:key"]]'
+./scripts/profile-inproc.sh --reply "$(head -c 4096 /dev/zero | tr '\0' x)"
+```
+
+Two things make it usable as an A/B:
+
+- **Judge changes on cycles per request, not throughput.** Closed-loop throughput on a machine doing
+  anything else swings ±15% run to run — wider than most changes worth making. Per-request cost holds
+  to about ±2%. The script prints the median of five runs first.
+- **The load generator is separable.** It runs on its own runtime with its threads named
+  `srh-loadgen`, so `perf report --comms srh-server` excludes it instead of leaving you to guess.
+  The generated `perf-report.txt` is already filtered that way.
+
+Vary the workload before concluding anything about conversion or serialization cost: those savings
+are proportional to payload size and pipeline depth, so a 12-byte reply understates them severalfold.
+
+The regular pre-PR correctness gate remains:
 
 ```bash
 cargo fmt --all -- --check
