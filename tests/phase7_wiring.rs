@@ -19,7 +19,9 @@ fn release_build_matches_the_linux_production_artifact_contract() {
     let workflow = source(".github/workflows/release.yml");
     for required in [
         "BIN_NAME: srh-rs",
-        "TARGET: x86_64-unknown-linux-musl",
+        "target: x86_64-unknown-linux-musl",
+        "target: x86_64-unknown-linux-gnu",
+        "TARGET: ${{ matrix.target }}",
         "cargo build --release --locked --target \"$TARGET\"",
         "deploy/srh-rs.service",
         "srh-config/tokens.example.json",
