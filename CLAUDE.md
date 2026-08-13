@@ -69,8 +69,12 @@ allowed; tokio I/O is not). `ports/` imports only domain types. `adapters/` and 
 import anything. **`main.rs` is the only place a concrete adapter type is named outside its
 own module.**
 
-`tests/dependency_rule.rs` enforces this for imports and fully-qualified paths while ignoring
-comments and Rust string/character literals. Treat a green run as necessary, not sufficient;
+The rule is also directional inside the crate: `domain/` and `ports/` never reference
+`crate::config`. They declare the configuration types they need, and `config.rs` populates
+them — never the reverse.
+
+`tests/dependency_rule.rs` enforces both halves for imports and fully-qualified paths while
+ignoring comments and Rust string/character literals. Treat a green run as necessary, not sufficient;
 the single-crate layout cannot make the dependency boundary compiler-enforced. `reqwest` stays
 in its forbidden list even though the crate is gone — the entry is now a tripwire against
 reintroduction (see below).

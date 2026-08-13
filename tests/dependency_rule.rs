@@ -3,6 +3,12 @@ use std::path::{Path, PathBuf};
 
 const FORBIDDEN_CRATES: [&str; 6] = ["fred", "axum", "reqwest", "hyper", "tower", "futures_util"];
 
+/// Intra-crate layering: `domain/` and `ports/` declare the configuration types they need and
+/// `config.rs` populates them, so a policy or port never reaches into the configuration layer
+/// for one. `crate::config` covers the direct path and `super::config` covers any relative
+/// walk up to it, including `super::super::config`.
+const FORBIDDEN_MODULE_PATHS: [&str; 2] = ["crate::config", "super::config"];
+
 #[test]
 fn domain_and_ports_do_not_reference_adapter_dependencies() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -40,11 +46,40 @@ fn inspect_source(path: &Path) {
             path.display()
         );
     }
+    if let Some(module_path) = forbidden_module_path(&code) {
+        panic!(
+            "{} references forbidden module path `{module_path}`; \
+             domain and ports own their configuration types and are populated from config.rs, \
+             never the other way round",
+            path.display()
+        );
+    }
 }
 
 fn forbidden_identifier(code: &str) -> Option<&str> {
     code.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
         .find(|token| FORBIDDEN_CRATES.contains(token))
+}
+
+fn forbidden_module_path(code: &str) -> Option<&'static str> {
+    let compact: String = code
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    FORBIDDEN_MODULE_PATHS
+        .into_iter()
+        .find(|forbidden| contains_path(&compact, forbidden))
+}
+
+/// Matches `forbidden` only as a complete path segment, so a module whose name merely starts
+/// with `config` (`crate::configuration`) is not mistaken for the configuration layer.
+fn contains_path(compact: &str, forbidden: &str) -> bool {
+    compact.match_indices(forbidden).any(|(index, _)| {
+        compact[index + forbidden.len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| !next.is_ascii_alphanumeric() && next != '_')
+    })
 }
 
 fn strip_comments_and_literals(source: &str) -> String {
@@ -210,7 +245,7 @@ fn starts_character_literal(chars: &[char], index: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{forbidden_identifier, strip_comments_and_literals};
+    use super::{forbidden_identifier, forbidden_module_path, strip_comments_and_literals};
 
     #[test]
     fn scanner_ignores_comments_and_strings() {
@@ -243,5 +278,39 @@ mod tests {
         let stripped = strip_comments_and_literals(source);
         assert!(!stripped.contains("tower"));
         assert_eq!(forbidden_identifier(&stripped), Some("hyper"));
+    }
+
+    #[test]
+    fn scanner_catches_configuration_layer_imports() {
+        for source in [
+            "use crate::config::JwtConfig;",
+            "use super::super::config::JwtConfig;",
+            "fn build(cfg: &crate::config::JwtConfig) {}",
+            "use crate :: config :: JwtConfig ;",
+            "use crate::config::{JwtConfig, PoolConfig};",
+        ] {
+            let code = strip_comments_and_literals(source);
+            assert!(
+                forbidden_module_path(&code).is_some(),
+                "configuration-layer import must be rejected: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn scanner_allows_names_that_merely_begin_with_config() {
+        for source in [
+            "use crate::configuration::Thing;",
+            "let configured = policy.config_floor();",
+            "// crate::config::JwtConfig",
+            "const NOTE: &str = \"crate::config\";",
+        ] {
+            let code = strip_comments_and_literals(source);
+            assert_eq!(
+                forbidden_module_path(&code),
+                None,
+                "must not be mistaken for the configuration layer: {source}"
+            );
+        }
     }
 }

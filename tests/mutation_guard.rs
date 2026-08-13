@@ -744,6 +744,15 @@ fn mutations(root: &Path) -> Vec<Mutation> {
         "        \"debt_forgiven_by_eviction_broken\",",
         Expectation::Killed,
     ));
+    // The architecture check itself: `domain/` reaching into the configuration layer compiles
+    // and passes every behavioral test, so only `tests/dependency_rule.rs` can catch it.
+    all.push(mutation(
+        "domain-imports-config-layer",
+        ACL,
+        "use crate::domain::identity::Identity;",
+        "use crate::config::PoolConfig;\nuse crate::domain::identity::Identity;",
+        Expectation::Killed,
+    ));
     all.push(mutation(
         "nightly-load-schedule-removed",
         LOAD_WORKFLOW,

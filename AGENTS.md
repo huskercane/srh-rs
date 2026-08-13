@@ -12,7 +12,7 @@ This Rust 2024 crate implements an Upstash-compatible Redis HTTP proxy. Keep the
 - `src/main.rs` is the composition root; `src/lib.rs` exposes application modules and shared state.
 - `tests/` holds integration and architecture tests. Build artifacts belong in `target/` and must not be committed.
 
-Preserve the dependency rule: `domain` and `ports` must not import Axum, Fred, Reqwest, Hyper, or Tower. Concrete adapter types should be named only in their module and in `main.rs`.
+Preserve the dependency rule: `domain` and `ports` must not import Axum, Fred, Reqwest, Hyper, or Tower, and must not reference `crate::config` — they declare the configuration types they need and `config.rs` populates them. Concrete adapter types should be named only in their module and in `main.rs`.
 
 ## Dependency Policy
 
