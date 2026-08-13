@@ -122,6 +122,8 @@ pub struct PoolConfig {
     pub breaker: BreakerConfig,
     // Server-controlled widening policy copied into every identity routed to this pool.
     pub allowed_script_sha256: HashSet<String>,
+    // Server-controlled narrowing floor applied to every identity routed to this pool.
+    pub key_prefix: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -306,6 +308,7 @@ impl Config {
                     Some(pool.breaker),
                 );
                 normalized.allowed_script_sha256 = allowed_script_sha256;
+                normalized.key_prefix = pool.key_prefix;
                 (name, normalized)
             })
             .collect();
@@ -428,13 +431,31 @@ impl Config {
             }
         }
 
-        for token in self.auth.static_tokens.values() {
-            if !self.pools.contains_key(&token.pool) {
+        for (name, pool) in &self.pools {
+            if let Some(prefix) = &pool.key_prefix {
+                crate::domain::key_prefix::validate(prefix).map_err(|error| {
+                    ConfigError::Validation(format!("pools.{name}.key_prefix is invalid: {error}"))
+                })?;
+            }
+        }
+        for (digest, token) in &self.auth.static_tokens {
+            let Some(pool) = self.pools.get(&token.pool) else {
                 return Err(ConfigError::Validation(format!(
                     "static token references missing pool '{}'",
                     token.pool
                 )));
-            }
+            };
+            crate::domain::key_prefix::resolve(
+                pool.key_prefix.as_deref(),
+                token.key_prefix.as_deref(),
+            )
+            .map_err(|error| {
+                ConfigError::Validation(format!(
+                    "static token {} for pool '{}' has invalid key_prefix: {error}",
+                    digest_prefix(digest),
+                    token.pool
+                ))
+            })?;
         }
         for (name, pool) in &self.pools {
             if pool.connection_string.expose().is_empty() {
@@ -523,6 +544,7 @@ impl PoolConfig {
             max_waiters: max_waiters.unwrap_or_else(|| max_connections.saturating_mul(4)),
             breaker: breaker.unwrap_or_default().into(),
             allowed_script_sha256: HashSet::new(),
+            key_prefix: None,
         }
     }
 }
@@ -872,6 +894,7 @@ struct RawPoolConfig {
     max_waiters: Option<usize>,
     breaker: RawBreakerConfig,
     allowed_script_sha256: Vec<String>,
+    key_prefix: Option<String>,
 }
 
 impl Default for RawPoolConfig {
@@ -884,6 +907,7 @@ impl Default for RawPoolConfig {
             max_waiters: None,
             breaker: RawBreakerConfig::default(),
             allowed_script_sha256: Vec::new(),
+            key_prefix: None,
         }
     }
 }
@@ -1002,6 +1026,51 @@ mod tests {
         let token = &config.auth.static_tokens[&digest_token("token")];
         assert!(token.allowed_script_sha256.contains("1234"));
         assert!(token.allowed_script_sha256.contains("abcdef"));
+    }
+
+    #[test]
+    fn parses_pool_key_prefix_and_accepts_a_static_extension() {
+        let config = Config::from_json(
+            r#"{"auth":{"static_tokens":{"token":{"pool":"cache","key_prefix":"tenant:user:"}}},"pools":{"cache":{"connection_string":"redis://localhost:6379","key_prefix":"tenant:"}}}"#,
+        )
+        .expect("pool and token prefixes should parse");
+        assert_eq!(config.pools["cache"].key_prefix.as_deref(), Some("tenant:"));
+        assert_eq!(
+            config.auth.static_tokens[&digest_token("token")]
+                .key_prefix
+                .as_deref(),
+            Some("tenant:user:")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_pool_key_prefixes_with_the_field_name() {
+        let error = Config::from_json(
+            r#"{"pools":{"cache":{"connection_string":"redis://localhost:6379","key_prefix":"tenant:*"}}}"#,
+        )
+        .expect_err("glob metacharacters must fail closed");
+        assert!(error.to_string().contains("pools.cache.key_prefix"));
+    }
+
+    #[test]
+    fn rejects_static_prefixes_outside_the_pool_floor_without_exposing_the_token() {
+        let error = Config::from_json(
+            r#"{"auth":{"static_tokens":{"secret-token":{"pool":"cache","key_prefix":"other:"}}},"pools":{"cache":{"connection_string":"redis://localhost:6379","key_prefix":"tenant:"}}}"#,
+        )
+        .expect_err("a static prefix may only extend its pool floor");
+        let message = error.to_string();
+        assert!(message.contains("pool 'cache'"));
+        assert!(message.contains(&digest_prefix(&digest_token("secret-token"))));
+        assert!(!message.contains("secret-token"));
+    }
+
+    #[test]
+    fn pool_key_prefix_keeps_unknown_field_validation_strict() {
+        let error = Config::from_json(
+            r#"{"pools":{"cache":{"connection_string":"redis://localhost:6379","key_prefix":"tenant:","key_prefx":"typo:"}}}"#,
+        )
+        .expect_err("a misspelled prefix field must fail closed");
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]

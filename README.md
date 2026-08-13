@@ -556,7 +556,10 @@ scope need an explicit `oidc-usermodel-client-role-mapper` whose claim name is
 the emitted claim in a real client-credentials token before exposing the endpoint.
 
 Additional claims: `srh_pool` selects the pool (falling back to `default` if configured),
-`srh_blocked_commands` adds to the blocklist, and `srh_key_prefix` is reserved for Phase 8.
+`srh_blocked_commands` adds to the blocklist, and `srh_key_prefix` narrows access below the
+selected pool's server-configured key-prefix floor. Emit `srh_key_prefix` only from an
+admin-controlled protocol mapper, never from a user-editable attribute. An absent claim does not
+remove a configured pool floor, and a claim that does not extend that floor is rejected.
 
 **Claims may only narrow.** `srh_blocked_commands` is safe by construction because it can only
 remove privilege. Anything that would widen privilege lives in server config. Emit `srh_pool`

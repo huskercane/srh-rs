@@ -4,6 +4,13 @@ use std::fmt::{self, Display, Formatter};
 
 use bytes::Bytes;
 
+/// Server-controlled policy shared by every identity routed to one pool.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolPolicy {
+    pub allowed_script_sha256: HashSet<String>,
+    pub key_prefix: Option<String>,
+}
+
 /// Authenticated permissions and routing information.
 #[derive(Clone, Eq, PartialEq)]
 pub struct Identity {

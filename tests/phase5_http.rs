@@ -115,7 +115,8 @@ impl Clock for ManualClock {
 fn app(config: Value) -> (axum::Router, Arc<RecordingProvider>, Arc<ManualClock>) {
     let config =
         Arc::new(Config::from_json(&config.to_string()).expect("test config should parse"));
-    let auth: Arc<dyn Authenticator> = Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
+    let auth: Arc<dyn Authenticator> =
+        Arc::new(StaticAuth::new(config.auth.static_tokens.clone(), &config.pools).unwrap());
     let executor = Arc::new(RecordingExecutor::default());
     let provider = Arc::new(RecordingProvider {
         executor,

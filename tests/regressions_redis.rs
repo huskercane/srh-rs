@@ -67,7 +67,7 @@ fn app(connection_string: String, manager: &mut Option<Arc<PoolManager>>) -> axu
         .expect("single-pool config should parse"),
     );
     let static_auth: Arc<dyn Authenticator> =
-        Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
+        Arc::new(StaticAuth::new(config.auth.static_tokens.clone(), &config.pools).unwrap());
     let clock: Arc<dyn Clock> = Arc::new(FixedClock);
     let pools = Arc::new(PoolManager::new(Arc::clone(&config), Arc::clone(&clock)));
     let provider: Arc<dyn ExecutorProvider> = pools.clone();

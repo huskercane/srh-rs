@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -9,7 +9,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::config::{JwtConfig, PoolConfig};
-use crate::domain::identity::{AuthError, Identity, JwtAlgorithm};
+use crate::domain::identity::{AuthError, Identity, JwtAlgorithm, PoolPolicy};
+use crate::domain::key_prefix::{self, PrefixError};
 use crate::ports::{Authenticator, Clock, Introspector, JwksSource};
 
 const MAX_INTROSPECTION_ENTRIES: usize = 100_000;
@@ -169,7 +170,7 @@ impl IntrospectionCache {
 /// Validates Keycloak access tokens using trusted keys supplied through a port.
 pub struct JwtAuth {
     config: JwtConfig,
-    pools: HashMap<String, HashSet<String>>,
+    pools: HashMap<String, PoolPolicy>,
     jwks: Arc<dyn JwksSource>,
     introspector: Option<Arc<dyn Introspector>>,
     introspection_cache: IntrospectionCache,
@@ -184,14 +185,22 @@ impl JwtAuth {
         introspector: Option<Arc<dyn Introspector>>,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        let scripts = pools
+        let policies = pools
             .iter()
-            .map(|(name, pool)| (name.clone(), pool.allowed_script_sha256.clone()))
+            .map(|(name, pool)| {
+                (
+                    name.clone(),
+                    PoolPolicy {
+                        allowed_script_sha256: pool.allowed_script_sha256.clone(),
+                        key_prefix: pool.key_prefix.clone(),
+                    },
+                )
+            })
             .collect();
         let cache_secs = config.introspection.cache_secs;
         Self {
             config,
-            pools: scripts,
+            pools: policies,
             jwks,
             introspector,
             introspection_cache: IntrospectionCache::new(cache_secs, clock),
@@ -273,9 +282,21 @@ impl JwtAuth {
             return Err(AuthError::Forbidden("NOPERM no redis role".to_owned()));
         };
         let pool = claims.srh_pool.unwrap_or_else(|| "default".to_owned());
-        let Some(allowed_script_sha256) = self.pools.get(&pool) else {
+        let Some(policy) = self.pools.get(&pool) else {
             return Err(AuthError::Forbidden("NOPERM invalid redis pool".to_owned()));
         };
+        let key_prefix = key_prefix::resolve(
+            policy.key_prefix.as_deref(),
+            claims.srh_key_prefix.as_deref(),
+        )
+        .map_err(|error| match error {
+            PrefixError::NotUnderFloor => {
+                AuthError::Forbidden("NOPERM key prefix outside pool policy".to_owned())
+            }
+            PrefixError::Empty | PrefixError::TooLong(_) | PrefixError::IllegalByte(_) => {
+                AuthError::Forbidden("NOPERM invalid key prefix claim".to_owned())
+            }
+        })?;
         Ok(Identity {
             subject: claims.sub.clone(),
             bucket_key: claims.sub,
@@ -289,8 +310,8 @@ impl JwtAuth {
                 .into_iter()
                 .map(|command| command.to_ascii_uppercase())
                 .collect(),
-            allowed_script_sha256: allowed_script_sha256.clone(),
-            key_prefix: claims.srh_key_prefix,
+            allowed_script_sha256: policy.allowed_script_sha256.clone(),
+            key_prefix,
         })
     }
 }
@@ -388,7 +409,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         Config::from_json(
             r#"{
                 "auth":{"jwt":{"issuer":"https://issuer.test/realms/test","audience":"srh","client_id":"srh"}},
-                "pools":{"default":{"connection_string":"redis://localhost:6379","allowed_script_sha256":["abcd"]}}
+                "pools":{"default":{"connection_string":"redis://localhost:6379","allowed_script_sha256":["abcd"],"key_prefix":"tenant:"}}
             }"#,
         )
         .unwrap()
@@ -455,6 +476,35 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         assert!(identity.blocked_commands.contains("CLIENT"));
         assert!(identity.allowed_script_sha256.contains("abcd"));
         assert_eq!(identity.key_prefix.as_deref(), Some("tenant:"));
+    }
+
+    #[tokio::test]
+    async fn pool_prefix_applies_when_claim_is_absent_and_rejects_widening_claims() {
+        let auth = auth(JwtAlgorithm::Rs256);
+        let mut absent = claims();
+        absent
+            .as_object_mut()
+            .expect("claims should be an object")
+            .remove("srh_key_prefix");
+        let identity = auth
+            .authenticate(&token(&absent, Algorithm::RS256))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity.key_prefix.as_deref(), Some("tenant:"));
+
+        for (claim, message) in [
+            ("other:", "NOPERM key prefix outside pool policy"),
+            ("", "NOPERM invalid key prefix claim"),
+        ] {
+            let mut candidate = claims();
+            candidate["srh_key_prefix"] = json!(claim);
+            assert_eq!(
+                auth.authenticate(&token(&candidate, Algorithm::RS256))
+                    .await,
+                Err(AuthError::Forbidden(message.to_owned()))
+            );
+        }
     }
 
     #[tokio::test]

@@ -117,7 +117,7 @@ fn app(
         .expect("test configuration should parse"),
     );
     let static_auth: Arc<dyn Authenticator> =
-        Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
+        Arc::new(StaticAuth::new(config.auth.static_tokens.clone(), &config.pools).unwrap());
     let executor: Arc<dyn CommandExecutor> = Arc::new(ScriptedExecutor::new(replies));
     let provider = Arc::new(TestProvider {
         executor,

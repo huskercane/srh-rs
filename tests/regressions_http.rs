@@ -62,7 +62,7 @@ fn chain_with_jwt_enabled(static_token: &str) -> AuthChain {
         Arc::new(FixedClock),
     ));
     let static_auth: Arc<dyn Authenticator> =
-        Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
+        Arc::new(StaticAuth::new(config.auth.static_tokens.clone(), &config.pools).unwrap());
     AuthChain::new(vec![jwt, static_auth])
 }
 

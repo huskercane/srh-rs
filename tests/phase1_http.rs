@@ -76,7 +76,7 @@ fn app() -> axum::Router {
         .expect("test configuration should parse"),
     );
     let static_auth: Arc<dyn Authenticator> =
-        Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
+        Arc::new(StaticAuth::new(config.auth.static_tokens.clone(), &config.pools).unwrap());
     app_with_auth(
         Arc::new(AuthChain::new(vec![static_auth])),
         config,
@@ -155,7 +155,7 @@ async fn base64_encoding_preserves_binary_bulk_values() {
         .expect("test configuration should parse"),
     );
     let static_auth: Arc<dyn Authenticator> =
-        Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
+        Arc::new(StaticAuth::new(config.auth.static_tokens.clone(), &config.pools).unwrap());
     let response = app_with_auth(
         Arc::new(AuthChain::new(vec![static_auth])),
         config,
@@ -190,7 +190,7 @@ async fn redis_errors_are_returned_verbatim() {
         .expect("test configuration should parse"),
     );
     let static_auth: Arc<dyn Authenticator> =
-        Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
+        Arc::new(StaticAuth::new(config.auth.static_tokens.clone(), &config.pools).unwrap());
     let message = "WRONGTYPE Operation against a key holding the wrong kind of value";
     let response = app_with_auth(
         Arc::new(AuthChain::new(vec![static_auth])),
@@ -224,7 +224,7 @@ async fn transient_backend_failures_are_503_with_retry_after() {
             .unwrap(),
         );
         let static_auth: Arc<dyn Authenticator> =
-            Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
+            Arc::new(StaticAuth::new(config.auth.static_tokens.clone(), &config.pools).unwrap());
         let response = app_with_auth(
             Arc::new(AuthChain::new(vec![static_auth])),
             config,
@@ -259,7 +259,7 @@ async fn oversized_response_fails_the_whole_request_with_bad_gateway() {
         .expect("test configuration should parse"),
     );
     let static_auth: Arc<dyn Authenticator> =
-        Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
+        Arc::new(StaticAuth::new(config.auth.static_tokens.clone(), &config.pools).unwrap());
     let response = app_with_auth(
         Arc::new(AuthChain::new(vec![static_auth])),
         config,

@@ -122,7 +122,7 @@ fn app(introspector: Option<Arc<dyn Introspector>>) -> axum::Router {
         Arc::clone(&clock),
     ));
     let static_auth: Arc<dyn Authenticator> =
-        Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
+        Arc::new(StaticAuth::new(config.auth.static_tokens.clone(), &config.pools).unwrap());
     srh_rs::http::router(AppState::new(AppStateInner {
         provider: Arc::new(Provider),
         authenticator: Arc::new(AuthChain::new(vec![jwt, static_auth])),

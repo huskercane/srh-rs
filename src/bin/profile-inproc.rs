@@ -180,8 +180,10 @@ fn build_state(args: &Args) -> AppState {
         .validate()
         .unwrap_or_else(|error| panic!("profiling config is invalid: {error}"));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let authenticator: Arc<dyn Authenticator> =
-        Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
+    let authenticator: Arc<dyn Authenticator> = Arc::new(
+        StaticAuth::new(config.auth.static_tokens.clone(), &config.pools)
+            .expect("validated static authentication should initialize"),
+    );
     let rate_limiter = Arc::new(RateLimiter::new(
         config.server.rate_limit.per_token_commands_per_sec,
         Arc::clone(&clock),

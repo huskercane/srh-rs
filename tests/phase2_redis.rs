@@ -84,7 +84,7 @@ async fn fred_executor_satisfies_contract_and_preserves_binary_values() {
         .expect("HTTP test configuration should parse"),
     );
     let static_auth: Arc<dyn Authenticator> =
-        Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
+        Arc::new(StaticAuth::new(config.auth.static_tokens.clone(), &config.pools).unwrap());
     let manager = Arc::new(PoolManager::new(Arc::clone(&config), Arc::new(TestClock)));
     let provider: Arc<dyn ExecutorProvider> = manager.clone();
     let app = srh_rs::http::router(AppState::new(AppStateInner {

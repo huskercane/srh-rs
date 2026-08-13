@@ -526,8 +526,8 @@ fn mutations(root: &Path) -> Vec<Mutation> {
     all.push(mutation(
         "jwt-pool-script-policy-dropped",
         JWT_AUTH,
-        "            allowed_script_sha256: allowed_script_sha256.clone(),",
-        "            allowed_script_sha256: HashSet::new(),",
+        "            allowed_script_sha256: policy.allowed_script_sha256.clone(),",
+        "            allowed_script_sha256: Default::default(),",
         Expectation::Killed,
     ));
     all.push(mutation(

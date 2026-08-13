@@ -3,5 +3,6 @@ pub mod breaker;
 pub mod compat;
 pub mod convert;
 pub mod identity;
+pub mod key_prefix;
 pub mod rate_limit;
 pub mod resp;

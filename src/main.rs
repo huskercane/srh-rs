@@ -45,8 +45,10 @@ async fn main() -> Result<()> {
     tracing::info!(address = %metrics_address, "metrics listener started");
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let static_auth: Arc<dyn Authenticator> =
-        Arc::new(StaticAuth::new(config.auth.static_tokens.clone()));
+    let static_auth: Arc<dyn Authenticator> = Arc::new(
+        StaticAuth::new(config.auth.static_tokens.clone(), &config.pools)
+            .context("failed to initialize static authentication")?,
+    );
     let (jwt_auth, authenticator): (Option<Arc<JwtAuth>>, Arc<dyn Authenticator>) =
         if let Some(jwt_config) = config.auth.jwt.clone() {
             let jwks: Arc<dyn JwksSource> = Arc::new(
