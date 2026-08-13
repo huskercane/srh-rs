@@ -73,6 +73,14 @@ The rule is also directional inside the crate: `domain/` and `ports/` never refe
 `crate::config`. They declare the configuration types they need, and `config.rs` populates
 them — never the reverse.
 
+<!-- TODO(phase8): this paragraph wants a concrete example, and `PoolPolicy` in
+     `domain/identity.rs` is it — a config-shaped struct declared in the domain and populated
+     by `config.rs`. It is omitted only because this branch forked from `main`, where
+     `PoolPolicy` does not exist yet; it arrives with phase 8. Add the reference once phase 8
+     merges. Same for `tests/dependency_rule.rs`, whose FORBIDDEN_MODULE_PATHS doc comment was
+     generalized for the same reason. -->
+
+
 `tests/dependency_rule.rs` enforces both halves for imports and fully-qualified paths while
 ignoring comments and Rust string/character literals. Treat a green run as necessary, not sufficient;
 the single-crate layout cannot make the dependency boundary compiler-enforced. `reqwest` stays
