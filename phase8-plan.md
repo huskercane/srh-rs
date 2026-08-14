@@ -360,6 +360,51 @@ Subcommand cases, one per hazard: `XINFO STREAM tenant:s` → allowed, `XINFO ST
 denied on the key; `MEMORY USAGE` and `OBJECT ENCODING` likewise; `XINFO` with no subcommand →
 denied; `XINFO NOTASUBCOMMAND tenant:s` → denied (**no fallback to the top-level entry**).
 
+### Performance and resource bounds
+
+This policy is on the per-command hot path, and pipelines run it once per slot. The qualitative
+choices above (a static table, an allocation-free visitor, and an immediate no-prefix return) are
+not enough by themselves; the implementation must preserve them measurably.
+
+**Lookup representation and complexity:**
+
+- Store the generated command table as a sorted static slice and use binary search. A linear scan
+  over the full Redis command table is not acceptable.
+- Compare the request's `NAME`, and `SUB` for container commands, to the static uppercase table
+  key with an ASCII-folding comparator over borrowed bytes. `NAME|SUB` is a conceptual key only:
+  do not allocate `format!("{name}|{sub}")`, an uppercased `String`, or another owned buffer to
+  perform the lookup.
+- Phase 8 must add **zero heap allocations** to an accepted policy check. `acl::check` currently
+  allocates its uppercased command name; Phase 8 must not add a second canonicalization
+  allocation. Removing the existing allocation is a worthwhile follow-up but is not required by
+  this phase.
+- Total prefix-policy work is `O(command_count + key_argument_count * prefix_length)`: one
+  `O(log table_size)` lookup per prefixed command plus one byte-prefix comparison per visited key.
+  The existing bounds make the worst case finite: 1,000 pipeline commands, 10,000 request
+  elements, and a 128-byte prefix. Integer parsing and index arithmetic in `KeyNum` must remain
+  checked so malformed counts cannot turn those bounds into overflow or unbounded work.
+
+Add a release-mode microbenchmark target covering:
+
+- unprefixed and prefixed `GET` (the first proves the `Option` fast path; the second is the common
+  protected path);
+- `XINFO STREAM` (container/subcommand canonicalization);
+- `MSET` with 1, 100, and the maximum request-bounded key count, with failures at the first and
+  last key;
+- a 1,000-slot pipeline of accepted `GET`s and a mixed pipeline with per-slot rejections.
+
+Record median time, throughput, allocation count, and allocated bytes on the same host before and
+after the Phase 8 wiring. These are review gates, not wall-clock CI assertions: the unprefixed
+path may regress by at most 5% at the median and may add no allocation; prefixed multi-key and
+pipeline cases must scale linearly, add no allocation, and show no step-change unrelated to the
+number of keys inspected. Check the benchmark target into the repository so later command-table
+or canonicalization changes can be compared against the same workloads.
+
+Finally, run one combined release scenario after issue #7 lands: a valid JWT whose effective
+identity has a pool prefix, carrying a 1,000-slot pipeline. JWT authentication runs once per
+request while this policy runs per command and per key; measuring only the two features in
+isolation can miss their production cost when those multiplicities meet.
+
 ## Commit 3 — Wiring, metric, and the drift guard
 
 - `command.rs:42`, `pipeline.rs:49`, and `multi_exec.rs` call `check_key_prefix` beside
