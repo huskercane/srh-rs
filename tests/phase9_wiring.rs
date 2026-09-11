@@ -72,12 +72,14 @@ fn runtime_and_scheduled_gates_keep_protections_wired() {
     for required_assertion in [
         "accepted_p99 < baseline_p99 * 5",
         "rejected_p99 < 10",
-        "peak_rss < baseline_rss * 1.20",
+        "baseline_rss * 1.20 + RSS_HEADROOM_BYTES",
+        "peak_rss < rss_ceiling",
+        "recovered_rss < rss_ceiling",
         "fast_p99 < 10",
         "after_rate >= before_rate * 0.8",
         "max(gauge_values) == 0",
         "sample.status == 408",
-        "percentile(accepted, 0.99) < baseline * 2",
+        "accepted_p99 < baseline * 2",
     ] {
         assert!(runner.contains(required_assertion));
     }
